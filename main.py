@@ -1,484 +1,1258 @@
-!pip install python-docx python-pptx mammoth pytesseract pymupdf chromadb sentence-transformers
-#pdfplumber
+# ============================================================
+#  Installations
+# ============================================================
 
-from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
-import pandas as pd
-from docx import Document as DocxDocument
-import mammoth
-from pptx import Presentation
-import zipfile
-import xml.etree.ElementTree as ET
-import requests
-from bs4 import BeautifulSoup
-import pytesseract
-from PIL import Image # scanned pdf extractor
-import fitz # PDF new extractor
-import re
-import os
+# ============================================================
+#  Package Import
+# ============================================================
+import easyocr
+from PIL import Image
+import numpy as np
+import torch
+import json
 from sentence_transformers import SentenceTransformer
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 import chromadb
-from chromadb.config import Settings
+import re
+import unicodedata
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+from collections import deque
+from pathlib import Path
+import fitz
+import time
+import hashlib
+import os
+import nest_asyncio
+import requests
+nest_asyncio.apply()
 from openai import OpenAI
-
-BASE_DATA_DIR = Path("/content/data")  # where you’ll put your files in Colab
-BASE_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-VECTOR_DB_DIR = "/content/chroma_db"
-# Initialize Chroma client
-chroma_client = chromadb.PersistentClient(
-    path=VECTOR_DB_DIR,
-    settings=Settings(anonymized_telemetry=False)
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
-COLLECTION_NAME = "arabic_rag_collection"
-EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
-
-# Initialize embedding model (CPU)
-embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-# Set your keys here or via environment variables in Colab
-OPENAI_API_KEY = "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"
-TELEGRAM_BOT_TOKEN = "8527483344:AAHg69NPJie_ZHJCrs2bGVoGDCtl7tf84iQ"  # <<< change this
-
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-def load_pdf(path: Path) -> str:
-    doc = fitz.open(path)
-    all_text = []
-
-    for page_index in range(doc.page_count):
-        # Load ONLY the specific page into RAM
-        page = doc.load_page(page_index)
-
-        # Extract text (very lightweight)
-        text = page.get_text("text", flags=fitz.TEXT_PRESERVE_LIGATURES)
-
-        # If empty fallback to block extraction (less RAM than OCR)
-        if not text.strip():
-            blocks = page.get_text("blocks")
-            text = " ".join(b[4] for b in blocks if len(b) >= 5)
-
-        all_text.append(text)
-
-        # Release memory for the loaded page
-        del page
-
-    doc.close()
-
-    return "\n".join(all_text)
-
-def load_docx(path: Path) -> str: # issue in the definition
-    doc = DocxDocument(str(path))
-    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-    if not paragraphs:
-      with open(path, "rb") as f:
-        result = mammoth.convert_to_html(f)
-        html = result.value
-
-      # Now extract text from HTML
-      soup = BeautifulSoup(html, "html.parser")
-
-      paragraphs = soup.get_text(" ", strip=True)
-      return paragraphs
-    return "\n".join(paragraphs)
 
 
-def load_pptx(path: Path) -> str:
-    prs = Presentation(str(path))
-    slide_texts = []
-    for slide in prs.slides:
-        for shape in slide.shapes:
-            if hasattr(shape, "text") and shape.text.strip():
-                slide_texts.append(shape.text)
-    if not slide_texts:
-      texts = []
-      # Open PPTX as a zip archive
-      with zipfile.ZipFile(path, 'r') as pptx:
-        # Iterate through all slide files
-        for slide_name in pptx.namelist():
-            if slide_name.startswith("ppt/slides/slide") and slide_name.endswith(".xml"):
-                xml_content = pptx.read(slide_name)
-                # Parse XML using builtin xml.etree (NO LXML)
-                root = ET.fromstring(xml_content)
-                # PPTX text nodes are usually inside <a:t> tags
-                namespace = {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'}
-                for node in root.iter():
-                    if node.tag.endswith("}t"):  # extract <a:t> text
-                        if node.text:
-                            texts.append(node.text.strip())
-      return "\n".join(texts)
-    return "\n".join(slide_texts)
+# --------------------------------------------------------
+# OCR, Embedding and Reranker Models and Vector DB setup
+# --------------------------------------------------------
 
-def load_excel_or_csv(path: Path) -> str:
-    # Excel or CSV to text: concatenate all cell values
-    if path.suffix.lower() == ".csv":
-        df = pd.read_csv(path)
-    else:
-        df = pd.read_excel(path)
+# --------------------------
+# OCR
+# --------------------------
 
-    # Convert all cells to strings, drop NaN
-    df = df.astype(str)
-    # You can customize how you flatten the table
-    return "\n".join(df.apply(lambda row: " | ".join(row.values), axis=1).tolist())
+print("🔍 Initializing EasyOCR (ar + en)...")
+easyocr_reader = easyocr.Reader(['ar', 'en'], gpu=True)
 
-def load_website(url: str) -> str:
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "lxml")
+# --------------------------
+# Load Embedding Model (1024-dim)
+# --------------------------
+def load_embedding_model():
+    model = SentenceTransformer(
+        "jinaai/jina-embeddings-v3",
+        trust_remote_code=True
+    )
+    return model
 
-    # Remove script/style
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
+# --------------------------
+# Load Reranker Model
+# --------------------------
+def load_reranker_model(device="cuda"):
+    model_name = "Alibaba-NLP/gte-multilingual-reranker-base"
 
-    texts = []
-    for element in soup.find_all(["h1", "h2", "h3", "h4", "p", "li"]):
-        text = element.get_text(separator=" ", strip=True)
-        if text:
-            texts.append(text)
-    return "\n".join(texts)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        torch_dtype=torch.float16
+    ).to(device)
 
+    return tokenizer, model
 
-def load_any(source: str) -> Tuple[str, Dict[str, Any]]:
-    """
-    source: file path (str) or URL (starting with http)
-    Returns: (text, metadata)
-    """
-    if source.startswith("http://") or source.startswith("https://"):
-        text = load_website(source)
-        metadata = {
-            "type": "website",
-            "source": source,
-            "title": source  # you can later parse <title> if you want
-        }
-        return text, metadata
+# --------------------------
+# Initialize Chroma
+# --------------------------
 
-    path = Path(source)
-    suffix = path.suffix.lower()
+# ---------------------------------
+# chromadb: a vector database with the core components id, content (i.e. documents), and metadata.
+# ID (ids): A [unique] string identifier for each data record within a collection.
+# Content (documents): The raw data (usually text) that you want to store and embed. Documents are converted into numerical vector embeddings using an embedding function.
+# Metadata (metadatas): A dictionary of additional information associated with each document, used for filtering, categorizing, and providing context.
+# ---------------------------------
+def init_chroma_collection(path=r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\chroma_store", name="healthcare_rag_v2"):
 
-    if suffix == ".pdf":
-        text = load_pdf(path)
-        doc_type = "pdf"
-    elif suffix in [".docx"]:
-        text = load_docx(path)
-        doc_type = "docx"
-    elif suffix in [".pptx"]:
-        text = load_pptx(path)
-        doc_type = "pptx"
-    elif suffix in [".xls", ".xlsx", ".csv"]:
-        text = load_excel_or_csv(path)
-        doc_type = "spreadsheet"
-    else:
-        # Fallback: try to read as plain text
-        text = Path(path).read_text(encoding="utf-8", errors="ignore")
-        doc_type = "text"
+    client = chromadb.PersistentClient(path=path)
 
-    metadata = {
-        "type": doc_type,
-        "source": str(path),
-        "title": path.name,
-    }
-    return text, metadata
+    # NEW collection name to avoid old schema!
+    collection = client.get_or_create_collection(
+        name=name,
+        metadata={"hnsw:space": "cosine"},
+        embedding_function=None
+    )
 
-sample_path = "/content/sample_data/ArrivalPost-Arb.pdf"  # change this
-text, meta = load_any(sample_path)
-print(meta)
-print(text[:1000])
+    print(f"📦 Fresh ChromaDB collection ready → {name}")
+    return collection
 
-ARABIC_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06ED]")
+# --------------------------
+# Store Chunks in Chroma
+# --------------------------
+def store_chunks_in_chroma(chunks, collection, embed_model, batch_size=32):
 
-def normalize_arabic(text: str) -> str:
-    # Remove tatweel
-    text = text.replace("ـ", "")
+    print(f"\n🚀 Storing {len(chunks)} chunks with batch size = {batch_size}")
 
-    # Normalize alef forms
-    text = re.sub("[أإآا]", "ا", text)
-    # Normalize taa marbuta to haa? (optional – can change search semantics)
-    text = text.replace("ة", "ه")
+    texts = [c["content"] for c in chunks]
+    ids = [c["id"] for c in chunks]
+    metas = [c["metadata"] for c in chunks]
 
-    # Remove diacritics
-    text = ARABIC_DIACRITICS.sub("", text)
-    # Remove markdown bold/italic
-    text = re.sub(r"\*+", "", text)
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i:i + batch_size]
+        batch_ids   = ids[i:i + batch_size]
+        batch_metas = metas[i:i + batch_size]
 
-    # Remove bullet prefixes
-    text = re.sub(r"^[\-\*\•]+\s*", "", text, flags=re.MULTILINE)
+        # Skip empty or None content
+        valid_batch = [
+            (t, idx, meta)
+            for t, idx, meta in zip(batch_texts, batch_ids, batch_metas)
+            if t and t.strip()
+        ]
 
-    # Normalize spaces
-    text = re.sub(r"\s+", " ", text).strip()
-
-    return text
-
-
-def clean_text(text: str) -> str:
-    if not text:
-        return ""
-    text = text.replace("\u200f", "")  # RTL mark
-    text = text.replace("\u200e", "")  # LTR mark
-    text = text.replace("\ufeff", "")  # BOM
-    return text
-
-def chunk_text(text, max_chars=800, overlap=200):
-    chunks = []
-    buffer = ""
-    overlap_buffer = ""
-
-    for line in text.split("\n"):
-        line = line.strip()
-        if not line:
+        if not valid_batch:
             continue
 
-        # Add line to current buffer
-        if len(buffer) + len(line) + 1 <= max_chars:
-            buffer += " " + line
-        else:
-            # Finalize chunk
-            chunk = buffer.strip()
-            if chunk:
-                chunks.append(chunk)
+        batch_texts, batch_ids, batch_metas = zip(*valid_batch)
 
-            # Start new buffer with overlap
-            if len(buffer) > overlap:
-                overlap_buffer = buffer[-overlap:]
-            else:
-                overlap_buffer = buffer
-
-            buffer = overlap_buffer + " " + line
-
-    # Add last chunk
-    if buffer.strip():
-        chunks.append(buffer.strip())
-
-    return chunks
-
-chunks = chunk_text(text)
-print("Number of chunks:", len(chunks))
-print(chunks[0][:400])
-
-collection = chroma_client.get_or_create_collection(
-    name=COLLECTION_NAME,
-    metadata={"hnsw:space": "cosine"},
-)
-
-def embed_texts(texts: List[str]) -> List[List[float]]:
-    # SentenceTransformer returns numpy array; convert to list
-    embeddings = embedding_model.encode(texts, batch_size=32, show_progress_bar=True)
-    return [emb.tolist() for emb in embeddings]
-
-
-import uuid
-from tqdm.auto import tqdm
-
-def index_source(source: str, doc_id_prefix: Optional[str] = None):
-    text, base_metadata = load_any(source)
-    chunks = chunk_text(text)
-
-    if not chunks:
-        print(f"No valid chunks for source: {source}")
-        return
-
-    print(f"Indexing {len(chunks)} chunks from {source}")
-
-    embeddings = embed_texts(chunks)
-
-    ids = []
-    metadatas = []
-    for i, chunk in enumerate(chunks):
-        chunk_id = f"{doc_id_prefix or str(uuid.uuid4())}_{i}"
-        ids.append(chunk_id)
-        md = base_metadata.copy()
-        md.update({
-            "chunk_index": i,
-        })
-        metadatas.append(md)
-
-    collection.add(
-        ids=ids,
-        embeddings=embeddings,
-        documents=chunks,
-        metadatas=metadatas,
-    )
-
-    print("Done indexing.")
-
-def index_many(sources: List[str]):
-    for src in tqdm(sources):
-        try:
-            index_source(src)
-        except Exception as e:
-            print(f"Error indexing {src}: {e}")
-
-sources = [
-    "/content/sample_data/ArrivalPost-Arb.pdf",
-    "https://www.moh.gov.sa/HealthAwareness/EducationalContent/wh/Pages/Hypothyroidism-and-Pregnancy.aspx",
-    "https://www.moh.gov.sa/HealthAwareness/EducationalContent/wh/Pages/001.aspx",
-    "/content/sample_data/2018-11-13-002.pdf"
-]
-index_many(sources)
-
-def retrieve_relevant_chunks(
-    query: str,
-    top_k: int = 5,
-) -> List[Dict[str, Any]]:
-    normalized_query = normalize_arabic(query)
-    query_embedding = embed_texts([normalized_query])[0]
-
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=top_k,
-        include=["documents", "metadatas", "distances"],
-    )
-
-    chunks = []
-    for doc, meta, dist in zip(
-        results["documents"][0],
-        results["metadatas"][0],
-        results["distances"][0],
-    ):
-        chunks.append({
-            "text": doc,
-            "metadata": meta,
-            "score": float(dist),
-        })
-    return chunks
-
-def clean_context_text(text: str) -> str:
-    """
-    Cleans chunk text before sending to the LLM:
-    - Removes Markdown (**bold**, *italic*)
-    - Removes bullets
-    - Removes repeated punctuation
-    - Normalizes spacing
-    - Keeps readable Arabic-only content
-    """
-
-    # Remove markdown bold/italic markers
-    text = re.sub(r"\*{1,3}", "", text)
-
-    # Remove markdown-like numbered items like **1. نص**
-    text = re.sub(r"\*+\s*(\d+)\s*\.*\s*\*+", r"\1.", text)
-
-    # Remove leading bullets
-    text = re.sub(r"^[\-\*\•]+\s*", "", text, flags=re.MULTILINE)
-
-    # Remove duplicated punctuation
-    text = re.sub(r"([\.؟!])\1+", r"\1", text)
-
-    # Remove multiple spaces
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-def build_prompt_arabic(question: str, contexts: List[Dict[str, Any]]) -> str:
-    """
-    Builds a clean Arabic prompt with:
-    - Cleaned contextual chunks
-    - No Markdown
-    - Strict source citation rules
-    """
-    context_lines = []
-
-    for i, c in enumerate(contexts, start=1):
-        src = c["metadata"].get("title") or c["metadata"].get("source") or f"chunk_{i}"
-        clean_text = clean_context_text(c["text"])
-
-        context_lines.append(
-            f"[المصدر {i}: {src}]\n{clean_text}"
+        # ==== Jina v3 embedding (correct call) ====
+        embeddings = embed_model.encode(
+            list(batch_texts),
+            task="retrieval.passage",
+            batch_size=1,            # best for Jina v3 on Colab
+            convert_to_numpy=True
         )
 
-    context_block = "\n\n".join(context_lines)
+        # ==== Store in Chroma ====
+        collection.add(
+            embeddings=embeddings.tolist(),
+            documents=list(batch_texts),
+            metadatas=list(batch_metas),
+            ids=list(batch_ids)
+        )
 
-    prompt = f"""
-السؤال: {question}
+        print(f"   → Stored {len(batch_ids)} chunks")
 
-النصوص المسترجعة من المصادر:
-{context_block}
+# --------------------------------------------------------
+# Preprocessing Phase
+# --------------------------------------------------------
 
-التعليمات:
-- أجب إجابة واضحة ومنسقة باللغة العربية فقط.
-- لا تستخدم أي علامات Markdown مثل ** أو * أو -.
-- لا تستخدم ترقيم تلقائي غير متسق.
-- استخدم فقط المعلومات الموجودة في النصوص أعلاه.
-- لا تضف أي مصادر غير الموجودة في القائمة أعلاه.
-- في نهاية الإجابة، لا تذكر أي مصادر. سيتم إظهارها تلقائياً لاحقاً.
+# --------------------------------------------------------
+# Arabic Normalization
+# --------------------------------------------------------
 
-الإجابة:
-"""
+# Arabic Base
+ARABIC_BASE = (
+    r"\u0600-\u06FF"   # Arabic core (letters, digits, punctuation)
+ )
 
-    return prompt.strip()
 
-def generate_answer_from_llm(prompt: str, model: str = "gpt-4o-mini") -> str:
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": (
-                "أنت مساعد ذكي متخصص في الإجابة باللغة العربية بشكل واضح ودقيق. "
-                "لا تستخدم Markdown. لا تستخدم **. "
-                "لا تضف أي مصادر إضافية غير التي تظهر في المقاطع."
-            )},
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=800,
-        temperature=0.1
+# harakat
+RE_DIACRITICS = re.compile(
+    r"[\u064B-\u065F]"
+)
+
+# Tatweel
+RE_TATWEEL = re.compile(r"\u0640")
+
+# All character not [Arabic or basic punctuation or whitespace or numbers or newlines]
+RE_NON_ARABIC = re.compile(
+    fr"[^{ARABIC_BASE}\u0660-\u0669\u0030-\u0039\s\.,؛،؟?!\-\/]"
+)
+
+# Collapse multiple spaces
+RE_MULTI_SPACE = re.compile(r"[ ]{2,}")
+
+# Collapse multiple lines
+RE_MULTI_NEWLINE = re.compile(r"\n+")
+
+
+def normalize_presentation_forms(text: str) -> str:
+    """
+    Converts Arabic contextual forms (ﻟﻼ, ﺍ, ﻫ, ﻲ…)
+    into their canonical Unicode letters without changing meaning.
+    Handle the issue in Arabic characters in PDFs and URLs
+    """
+    return unicodedata.normalize("NFKC", text)
+
+def normalize_arabic_text(text: str) -> str:
+    """
+    STRICT Arabic text normalization.
+    - Removes noise
+    - Preserves meaning
+    - Avoids destructive letter substitutions
+    """
+
+    # 1) Normalize contextual forms (no letter identity change)
+    text = normalize_presentation_forms(text)
+
+    # 2) Remove diacritics (tashkeel) ONLY
+    text = RE_DIACRITICS.sub("", text)
+
+    # 3) Remove tatweel (ـ)
+    text = RE_TATWEEL.sub("", text)
+
+    # 4) Remove all non-Arabic characters (foreign letters, noise)
+    text = RE_NON_ARABIC.sub(" ", text)
+
+    # 6) Normalize whitespace
+    text = RE_MULTI_SPACE.sub(" ", text).strip()
+
+    # 6) Normalize newlines
+    text = RE_MULTI_NEWLINE.sub("\n", text)
+
+    return text
+
+
+# --------------------------------------------------------
+# Check string lines that are likely to be headers.
+# first, remove duplicated spaces, and find string with multiple words and a total number of characters between 6 and 80
+# if found, look for expected heading characters (words or digits)
+# if not found, look for string with no ending punctation, less than 60 character length, and few inner punctations
+# if not found, then the line is most likely not a header
+# --------------------------------------------------------
+
+def is_probable_arabic_heading(line: str) -> bool:
+
+    s = re.sub(r"\s+", " ", line).strip() # remove the multiple spaces and replace them with one space. If single word, no space will be present (strip)
+    if not s: # if string is empty, return false
+        return False
+
+    if 6 <= len(s) <= 80 and s.count(" ") <= 10: # test if the line string is short and has between 1 and 10 spaces
+        # Common Arabic heading keywords
+        if re.search(r"\b(الفصل|الباب|المبحث|المطلب|المسألة|تمهيد|مقدمة|خاتمة|الفرع|الجزء)\b", s):
+            return True
+        # Numbered headings:  "أولاً" etc.
+        if re.match(r"^\s*(أولاً|ثانياً|ثالثاً|رابعاً|خامساً|سادساً|سابعاً|ثامناً|تاسعاً|عاشراً)\b", s):
+            return True
+
+        # All-caps doesn't apply in Arabic; but "title-like" lines sometimes end without punctuation
+        if not re.search(r"[\.؟!]\s*$", s) and len(s) <= 60: # look for line strings that don't end with punctuation and contains less that 60 characters
+            # If it has few punctuation marks and looks like a title line
+            punct = re.findall(r"[:]", s) # extract punctations to further test the text validity as header, if less than 3 punctuations, then it is most likely a header
+            if len(punct) == 1:
+                return True
+    return False
+
+# --------------------------------------------------------
+# Remove spaces present before or after newlines
+# split text by punctation [. ؟ ! ؛]
+# create a list of the splitted paragraph
+# --------------------------------------------------------
+def split_arabic_sentences(text: str):
+
+    # Normalize whitespace before splitting
+    text = re.sub(r"\s+\n", "\n", text) # remove any space before newlines
+    text = re.sub(r"\n\s+", "\n", text) # remove any space after newlines
+    text = re.sub(r"[ \t]+", " ", text) # remove tabs and replace them with space
+
+    parts = re.split(r"[\.؟!\n]+", text) # split sentence using boundaries: . ؟ ! and Arabic semicolon "؛"
+    return [p.strip() for p in parts if p and p.strip()] # remove additional spaces on any side of the splitted text
+
+# --------------------------------------------------------
+# First, check if (text) contain string, if yes, split the (text) by line and append it to the list (lines).
+# Next, create a set (heading_lines) for headings and add the elements of (lines) that are most likely heading lines
+
+# second, create an empty list (sentences) that contains the elements from (text) splitted by punctation
+# Next, create an empty list (normalized_sents) to should contain splitted strings with less than or equal 350 characters
+
+## Important output : normalized_sents & heading_lines ##
+
+# third, create an empty list (chunks) for the final text chuck to be stored in chromadb
+# Also, create a placeholder (current_sent) to incrementally add text from (normalized_sents) until we reach threshold 600 characters
+# Also, create a placeholder (current_len) to track the length of text in the placeholder (current_sent)
+
+# fourth, loop through each (normalized_sents) element (sent), if the element (sent) is not empty, check if it identified as heading line
+# or present in the previously defined list (heading_lines), if present, append (current_sent) if exist to (chunks) and start a new chunk
+# by resetting the (current_sent) and (current_len) variables.
+# Next, start the (current_sent) with the heading line and assign the (current_len) the length of the (current_sent)
+## ![Even if the current_sent didn't reach 600 yet, once we hit heading line, we will start new chunk] ##
+
+# fifth, if the (sent) is not a heading line, it must be appended to the existing (current_len). Calculate the value len(sent) + len(current_len)
+# if the result is less than 600, append (sent) to (current_sent) and update the length, else, flush the chunk and start a new chunk with (sent)
+# Next, apply the overlap function to keep the context of text, however, if applying overlap will make the sentence exceed 600, then remove the overlap
+# and just append the (sent) to empty (current_sent) and reset the (current_len)
+## ![overlap is only applied when a chunk overflows]
+
+# Finally, flush the (chunks) to reset variables for the next run
+# --------------------------------------------------------
+
+def semantic_chunk_text_v2(
+    text: str,
+    chunk_size: int = 600, # maximum full chunk size
+    overlap_sentences: int = 2, # number of sentences to overlap
+    max_sentence_len: int = 350, # maximum sentence length
+):
+
+    if not text or not text.strip(): # check if the text sent for chunking is empty, null, or consists of only whitespace
+        return []
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]# split the text by line and remove proceeding and preceeding spaces
+
+    heading_lines = set() # create set for headings
+
+    for ln in lines: # for each line, test if it was a heading line
+        if is_probable_arabic_heading(ln):
+            heading_lines.add(ln)
+
+    sentences = split_arabic_sentences(text) # create splitted list using punctations [this includes heading, we will split heading later using the heading_lines set]
+
+    normalized_sents = [] # create a list to contain text splits with size less than or equal to the maximum sentence length
+    for s in sentences: # for each item in the list of text splitted by punctations
+        s = s.strip()
+        if len(s) <= max_sentence_len: # check the length, if it is less than the maximum sentence size, append it to the list
+            normalized_sents.append(s)
+        else:
+            subparts = re.split(r"[،,]+", s) # if the length is more than 350 characters, look for commas, and split by comma
+            subparts = [sp.strip() for sp in subparts if sp.strip()] # create a list of the new splitted long text
+            if len(subparts) <= 1: # if the number of items in the list is zero or 1 [zero is produced if the substring contains empty since we use strip()]
+                for k in range(0, len(s), max_sentence_len):  # recursively split and append 350 characters until we cover the whole string
+                    normalized_sents.append(s[k:k+max_sentence_len].strip())
+            else:
+                normalized_sents.extend(subparts)  # append the large text chunks to the final list
+
+    chunks = [] # list to contain the list of PDF text chunks
+    current_sents = [] # list to contain text to be stored in a single chunk
+    current_len = 0 # the length of each current_sents to be stored in a chunk
+
+    # --------------------------------------------------------
+    # reset the current sentence and the current chunk length
+    # but first, append the current sentence to the final chunk list and append white space before the sentence
+    # --------------------------------------------------------
+    def flush_chunk():
+        nonlocal current_sents, current_len # define global variables inside function
+        if current_sents:
+            chunks.append(" ".join(current_sents).strip())
+        current_sents = []
+        current_len = 0
+
+    # --------------------------------------------------------
+    # append the current sentence to the final chunk list and append white space before the sentence
+    # then reset the current_sents and current_len
+    # --------------------------------------------------------
+    def apply_overlap():
+        nonlocal current_sents, current_len # define global variables inside function
+
+        if overlap_sentences <= 0 or not chunks: # if no overlap is specified in function call or we don't have values in chunk list yet, skip
+            return
+        # if we have chunk and overlap values are set
+        prev = chunks[-1] # get the last chunk stored in chunk list
+        prev_sents = split_arabic_sentences(prev) # use split_arabic_sentences to get a list of sentences in last chunk
+        tail = prev_sents[-overlap_sentences:] if prev_sents else []  # get only the last two sentences present in the last chunk
+        current_sents = tail[:]  # start the current sentence with the last two sentences of the last chunk
+        current_len = sum(len(x) + 1 for x in current_sents) # calculate the number of characters in the current sentence as initial chunk size
+
+    # --------------------------------------------------------
+
+    for sent in normalized_sents: # loop through the list of text divided to string values less than or equal to 350 characters
+        if not sent: # if there is no string, move to the next element of the list
+            continue
+
+        if sent in heading_lines or is_probable_arabic_heading(sent): # test if the sentence is part of the heading list or could be a heading after splitted by punctation.
+            flush_chunk() # reset the chunking trackers (length and current sentence)
+            # Start new chunk with the heading line (no overlap)
+            current_sents = [sent] # starting a new chunk with new line
+            current_len = len(sent) + 1 # initialize the current chunk size
+            continue
+
+        add_len = len(sent) + (1 if current_sents else 0) # if the splitted sentence wasn't a heading and current sentence tracker wasn't empty, calculate the expected new current sentence
+        if current_len + add_len <= chunk_size: # if merging the current sentence with the splitted sentence is less than the maximum chunk size, append the splitted sentence to current sentence and increase the length
+            current_sents.append(sent)
+            current_len += add_len
+        else: # else reset the current_sentence and start with the sentence as a new chunk, apply the overlap
+            flush_chunk()
+            apply_overlap()
+            # If overlap itself is already too big, drop overlap (rare but possible)
+            if current_len + len(sent) + 1 > chunk_size and current_sents:
+                current_sents = [] # remove overlap from current_sents
+                current_len = 0 # reset the current_sents character counter
+            add_len = len(sent) + (1 if current_sents else 0)
+            current_sents.append(sent) # append the sentence to the current_sents
+            current_len += add_len # update the character length in current_sents
+
+    flush_chunk() # once we are done with all the normalized text, flush the chunk and reset all trackers
+    return [c for c in chunks if c.strip()]
+
+
+def extract_pdf_page_text(page, ocr_reader=easyocr_reader, dpi=300):
+    """
+    1) Try PyMuPDF text extraction first.
+    2) If page contains no text or PyMuPDF fails → do OCR using EasyOCR.
+    """
+
+    # ---------- Strategy 1: PyMuPDF text ----------
+    try:
+        txt1 = page.get_text("plain") or ""
+        txt2 = page.get_text("blocks") or ""
+        txt3 = page.get_text("layout") or ""
+
+        # Combine these
+        combined = " ".join([
+            txt1,
+            " ".join(b[4] for b in txt2) if isinstance(txt2, list) else "",
+            txt3
+        ]).strip()
+
+        # If PyMuPDF finds real text, return it
+        if combined and len(re.findall(r"[ء-ي]", combined)) > 5:
+            return combined
+
+    except Exception:
+        pass  # PyMuPDF failed → will fallback to OCR
+
+
+    # ---------- Strategy 2: OCR Fallback ----------
+    try:
+        # Render page as high-resolution image
+        pix = page.get_pixmap(dpi=dpi)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+        # Convert to array
+        img_np = np.array(img)
+
+        # Run OCR
+        ocr_result = ocr_reader.readtext(img_np, detail=0)
+
+        ocr_text = " ".join(ocr_result).strip()
+
+        if ocr_text:
+            return ocr_text
+
+    except Exception as e:
+        print(f"⚠️ OCR failed on page {page.number+1}: {e}")
+        return ""
+
+# --------------------------------------------------------
+# PDF Loader
+# --------------------------------------------------------
+
+def chunk_pdf_pages(
+    input_pdf_path,
+    output_jsonl_path=None,
+    normalize=True,
+    min_chars=15,
+    chunk_size=600,
+    overlap=150
+):
+    pdf = fitz.open(input_pdf_path)
+    chunks = []
+    doc_name = Path(input_pdf_path).stem # get the file name
+
+    print(f"\n📘 Processing PDF: {doc_name}")
+    print(f"Total pages: {len(pdf)}")
+
+    for i in range(len(pdf)):
+        page = pdf[i]
+
+        # Extract via hybrid method
+        raw_text = extract_pdf_page_text(page)
+
+        if not raw_text or len(raw_text.strip()) < min_chars:
+            print(f"⚠️ Page {i+1}: No extractable text → Skipped")
+            continue
+
+        if normalize:
+            cleaned = normalize_arabic_text(raw_text)
+
+        # check if the cleaned text contain the least number of arabic characters
+        arabic_chars = re.findall(r"[ء-ي]", cleaned)
+        if len(arabic_chars) < 10:
+            print(f"⚠️ Page {i+1}: Insufficient Arabic content → Skipped")
+            continue
+
+        # send the text to chunking
+        page_chunks = semantic_chunk_text_v2(
+            cleaned,
+            chunk_size=chunk_size,
+            overlap_sentences=4
+        )
+
+        # store the final chunk into the chromadb
+        for j, ch_text in enumerate(page_chunks, start=1):
+            cid = f"{doc_name}_page_{i+1}_chunk_{j}"
+
+            chunks.append({
+                "id": cid,
+                "page_number": i+1,
+                "chunk_index": j,
+                "content": ch_text,
+                "metadata": {
+                    "source": doc_name,
+                    "type": "PDF_page",
+                    "page": i+1
+                }
+            })
+
+        print(f"✅ Page {i+1}: {len(page_chunks)} semantic chunks created")
+
+
+    print(f"\n📦 Completed PDF extraction: {len(chunks)} chunks generated")
+    return chunks
+
+# ============================================================
+#  Initialize models & vector DB
+# ============================================================
+if __name__ == "__main__":
+    # Load embedding model
+    embed_model = load_embedding_model()
+
+    # Load reranker (tokenizer + model)
+    reranker_tokenizer, reranker_model = load_reranker_model()
+
+    # Initialize Chroma collection
+    collection = init_chroma_collection()
+
+    print("\n✅ All models and vector database initialized successfully!")
+
+# ============================================================
+#  URL Loader
+# ============================================================
+
+#--------------------------------------------------
+# ChromaDB accepts only unique IDs, but when chunking URL-PDF files page by page, we still access the same URL,
+# hence, we create a new ID value by concatenating URL with additional text ->
+# {_pdf_{page_number+1}_chunk_{chunk_number}; page_number starts with 0 in the enumerator, so we add 1 to reflect actual page_number}
+# the new string ID will be converted into a hashed format, so we first convert it into bytes.
+# Later, we convert the hash result into hexadecimal string (to make it easily readable by human) and pick only the first 12 charachters
+# (sufficient to get unique string, the ) Example below,
+# 'https://example.com/page?id=42' -> b'\x8f\xb2\x8c\x8a\x0e\x17\x8a\xac\x9d\xad\x84\.. -> 8fb28c8a0e178aac..
+#--------------------------------------------------
+def make_uid(url: str, extra: str = ""):
+    base = url + extra
+    h = hashlib.sha1(base.encode("utf-8")).hexdigest()[:12]
+    return f"{h}"
+
+#--------------------------------------------------
+# Define a string to check that every link visited is within the
+# domain of Ministry of Health website. We don't want to go to other domains like: google.com
+#--------------------------------------------------
+BASE_DOMAIN = "moh.gov.sa"
+
+#--------------------------------------------------
+# Define a list of string to exclude links that won't be considered during the crawling process
+# awarenessplateform/EducationalSeries and awarenessplateform/PublishingImages: Contain mostly videos and images
+# _layouts: Settings and admin tasks, not meant for user content
+# Style%20Library: CSS, JS, fonts, and design assets
+# SiteAssets: Replaces much of Style%20Library in modern sites. It has easier permission management.
+# Images: Image storage folder
+#--------------------------------------------------
+EXCLUDE_PREFIXES = [ "/awarenessplateform/EducationalSeries", "/awarenessplateform/PublishingImages", "/_layouts/", "/Style%20Library/", "/SiteAssets/", "/Images/", ]
+
+#--------------------------------------------------
+# Define a list of string to the URLs with content type in text/html and application/xhtml+xml (the types for most popular well-structured human readable urls).
+# text/html: page_type = text, subtype = html. i.e. this response (url) is an HTML document
+# application/xhtml+xml: page_type = application, subtype = xhtml+xml. i.e. this response (url) is an XHTML, which is HTML written as strict XML. It was an attempt to control HTML documents structure.
+#--------------------------------------------------
+VALID_CONTENT_TYPES = ["text/html", "application/xhtml+xml"]
+
+#--------------------------------------------------
+# To make the HTTP request look like it’s coming from a real web browser, not from a script or bot.
+# We add this header because when we use requests in python, many websites block the request to protect the content.
+# Websites associate the python requests with bots, scrapers, and abuse
+# User-Agent: the type of client we pretend to be.
+#--------------------------------------------------
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/120.0"
+}
+
+#--------------------------------------------------
+# Canonicalize links to remove the parts useless in the content url source.
+# urlparset: takes a URL string and returns a structured object. ex.
+# "https://example.com:8080/path/page?x=1#section"
+# ParseResult(scheme='https',netloc='example.com:8080',path='/path/page',params='',query='x=1',fragment='section')
+# To identfy source links, we keep [scheme + netloc + url + path + query] and remove fragmentation.
+# Fragmentation appears in many cases, like when the link tag has an id value (eg. <a id = "section"> Click here </a>)
+#--------------------------------------------------
+def canonicalize_url(url):
+    parsed = urlparse(url)
+    query = f"?{parsed.query}" if parsed.query else "" # extract the query part if exists
+    clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}{query}"
+    clean = clean.split("#")[0] # additional checkup to make sure that we exclude everything after the first #. In rare cases, the parser may include the first # in query or path if there are multiple # values in the link (https://example.com/page#section#extra).
+    return clean
+
+#--------------------------------------------------
+# check the validity of the url
+# check if the link is within the valid domain (Ministry of Health), if yes, return false.
+# check if the link is for an english content url, if yes, return false.
+# check if the path is matching the path we are crawling, if no, return false.
+# check if the path starts with any of the strings for link types we are excluding, if yes, return false.
+#--------------------------------------------------
+
+def is_valid_internal(url: str) -> bool:
+    parsed = urlparse(url)
+
+    if parsed.netloc.lower() not in [BASE_DOMAIN, f"www.{BASE_DOMAIN}"]:
+        return False
+
+    path = parsed.path.lower()
+
+    # ✅ Reject English pages
+    if path.startswith("/en/"):
+        return False
+
+    # Must be inside awareness platform
+    if "/healthawareness/beforemarriage/" not in path:# update to targeted path
+
+        return False
+
+    for ex in EXCLUDE_PREFIXES:
+        if path.startswith(ex.lower()):
+            return False
+
+    return True
+#--------------------------------------------------
+# check if the url points to a pdf file
+#--------------------------------------------------
+def is_pdf(url):
+    return url.lower().endswith(".pdf")
+
+
+#--------------------------------------------------
+# BeautifulSoup: a python library used for web scraping, creating a parse tree that allows for easy navigation,
+# searching, and modification of data from web pages
+# remove from the parsed tree all the tags that are not needed to be scraped.
+# first check if there are any SharePoint related containers, extract their text, and return the cleaned version as the function output.
+# if there is nothing related to SharePoint, check main tag for content, and return the cleaned version as the function output.
+# if there is nothing related to SharePoint and nothing in main tag, return  the cleaned version of whatever is present in the HTML as the function output.
+#--------------------------------------------------
+def extract_main_content(html):
+    soup = BeautifulSoup(html, "html.parser")
+
+    # remove from the parsed tree all the tags that are not needed to be scraped.
+    for bad in ["script", "style", "header", "footer", "nav", "svg", "iframe"]:
+        for t in soup.find_all(bad):
+            t.decompose()
+
+    # Define a list of the styling classes that are commonly used to populate SharePoint content,
+    # if not available, then extract the article body from the HTML.
+    # e.g. for SharePoint content within HTML: <div class="ms-rtestate-field"> <p>This is SharePoint content.</p> </div>
+    # use select_one for CSS class to pick the first appearance of a content block.
+    # use find() since it exists once in each web-page, switchting to select_one will give the same but it will be a bit of an overhead on the parser.
+    # ms-rtestate-field, article__body, and : styling classes for SharePoint content
+    # check the text explanation at the bottom of this file for further explanation.
+    candidates = [
+        # Most MOH pages use this
+        soup.select_one(".ms-rtestate-field"),
+
+        # Alternative block
+        soup.select_one(".article__body"),
+
+        # ID used in some disease categories
+        soup.select_one("#ctl00_PlaceHolderMain_ContentMain"),
+
+        # Fallback main container for some templates, last hope to extract SharePoint if exists
+        soup.select_one(".contentPage"),
+
+        # Some pages wrap content inside article tags
+        soup.find("article"),
+    ]
+
+    # Extract text from extracted objects containing SharePoint content and sending it to normalize_arabic_text
+    for c in candidates:
+        if c and c.get_text(strip=True):
+            text = c.get_text(" ", strip=True)
+            return normalize_arabic_text(text)
+
+    # If there was no SharePoint content returned, check the main tag for content
+    main_tag = soup.find("main")
+    if main_tag:
+        return normalize_arabic_text(main_tag.get_text(" ", strip=True))
+
+    # last hope
+    return normalize_arabic_text(soup.get_text(" ", strip=True))
+
+#--------------------------------------------------
+# Request PDF from the HTTP server, if request is not failed, read the PDF file
+# For each PDF page, extract the text, check the character threshold,
+# check the Arabic characters threshold, clean the text, chunk it, and store it in DB
+#--------------------------------------------------
+def extract_pdf(
+    url,
+    normalize=True,
+    min_chars=20,
+    min_arabic_chars=10,
+    chunk_size=600,
+    overlap_sentences=2,
+):
+    print(f"📄 PDF → {url}")
+
+    # GET request to the URL
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status() # throw exception if status was error code
+    except Exception as e:
+        print(f"❌ PDF download failed: {e}")
+        return []
+
+    # If no exception was thrown,
+    try:
+        pdf = fitz.open(stream=resp.content, filetype="pdf") # open PDF using PyMuPDF library
+    except Exception as e:
+        print(f"❌ PDF parse failed: {e}")
+        return []
+
+    out = []
+    name = Path(urlparse(url).path).stem # extract the name of the PDF file, "https://example.com/files/report.pdf" -> report.pdf
+
+    # enumerate through the PDF pages
+    for i, page in enumerate(pdf):
+
+        # extract text from the PDF page
+        raw_text = extract_pdf_page_text(page)
+
+        # if extracted text is less than 20 characters, ignore
+        if not raw_text or len(raw_text.strip()) < min_chars:
+            continue
+
+        # clean the extracted text
+        if normalize:
+          cleaned = normalize_arabic_text(raw_text)
+
+        # ensure that the text contains at least 20 Arabic character, else ignore
+        arabic_chars = re.findall(r"[ء-ي]", cleaned)
+        if len(arabic_chars) < min_arabic_chars:
+            continue
+
+        # apply semantic chunking to the extracted text
+        page_chunks = semantic_chunk_text_v2(
+            cleaned,
+            chunk_size=chunk_size,
+            overlap_sentences=overlap_sentences,
+        )
+
+        # enumerate through the PDF chunks and insert each chunk into the DB
+        for j, ch_text in enumerate(page_chunks, start=1):
+            out.append({
+                "id": make_uid(url, f"_pdf_{i+1}_chunk_{j}"),
+                "content": ch_text.strip(),
+                "metadata": {
+                    "type": "PDF_page",
+                    "source": name,
+                    "page": i + 1,
+                    "chunk": j,
+                    "page_url": url
+                }
+            })
+
+    return out
+
+#--------------------------------------------------
+# Create a set of the links that are extracted from the URL
+# look for traditional embedded links, validate them and add them to the set.
+# create an string object to apply string search functions and find urls that are not contained in usual tags (a, iframe)
+# first, look for complete URLs that are encapsulated in quotes (single/double)
+# second, look for incomplete URLs that contain the targeted path and are encapsulated in quotes (single/double)
+# third, look for links present in tags with attributes = data-url and data-href, these are no encapsulated in quotes
+# finally, look for links in JS navigation
+#--------------------------------------------------
+
+def extract_links(soup, base):
+    found = set()
+
+    # look for normal and usual tags holding links within HTML structure
+    for tag, attr in (("a", "href"), ("iframe", "src")):
+      for el in soup.find_all(tag):
+        link = el.get(attr)
+        if not link:
+            continue
+        absolute = canonicalize_url(urljoin(base, link))
+        if is_valid_internal(absolute):
+            found.add(absolute)
+
+
+    html = str(soup) # create text object to use findall
+
+    # 1) Absolute URLs in quotes
+    for link in re.findall(r'["\'](https?://[^"\']+)["\']', html):
+        absolute = canonicalize_url(link)
+        if is_valid_internal(absolute):
+            found.add(absolute)
+
+    # 2) Relative internal URLs in quotes. e.g., onclick="go('/awarenessplateform/home.aspx')"
+    patterns = [r'["\'](/awarenessplateform/[^"\']*\.aspx[^"\']*)["\']',
+    r'["\'](/healthawareness/[^"\']*\.aspx[^"\']*)["\']']
+
+    for pat in patterns:
+      for link in re.findall(pat, html, flags=re.I):
+        link = link.lower()  # normalize the path
+        absolute = canonicalize_url(urljoin(base, link))
+        if is_valid_internal(absolute):
+          found.add(absolute)
+
+    # 3) Retrieve the data-href and data-url values. e.g., <div data-href="/awarenessplateform/home.aspx"> .. </div>, <span data-url="https://example.com/page"></span>
+    # splitted from the above loop solution because it usually doesn't contain quotes
+    for link in re.findall(r'(?:data-href|data-url)\s*=\s*["\']([^"\']+)["\']', html, flags=re.I):
+        absolute = canonicalize_url(urljoin(base, link))
+        if is_valid_internal(absolute):
+            found.add(absolute)
+
+    # 4) JS navigation assignments. e.g., window.location = "/awarenessplateform/home.aspx"; location.href = "https://example.com/login";
+    for link in re.findall(r'(?:window\.location|location\.href)\s*=\s*["\']([^"\']+)["\']', html, flags=re.I):
+        absolute = canonicalize_url(urljoin(base, link))
+        if is_valid_internal(absolute):
+            found.add(absolute)
+
+
+    return found
+
+#--------------------------------------------------
+# Define a set for the visited links to avoid accessing the same link more than once.
+# Define a deque object: a double-ended queue data structure, which allows for efficient addition and removal of elements from both the front and the rear.
+# Define the list of URLs that we will access to manage the run time easily.
+# Define a final list to contain all the web/web-PDF chunks
+# Start with the first appended link, canonicalize it, append it to visited, check its type (PDF, URL, none)
+# If it was for PDF, send it to PDF_extract, if it was for URL, send it to extract_main_content, if it wa not valid, ignore it.
+# Append the chunks to the final chunk list
+# Explore embedded links and add them to the links queue
+#--------------------------------------------------
+def crawl_all_awareness(max_pages=1500, delay=0.15):
+    visited = set()
+    queue = deque()
+
+    SEED_URLS = [
+        #"https://www.moh.gov.sa/AwarenessPlateform/ChronicDisease/Pages/default.aspx?PageIndex=1",
+        #"https://www.moh.gov.sa/awarenessplateform/Patientsrights/Pages/default.aspx"
+        #"https://www.moh.gov.sa/awarenessplateform/OralHealth/Pages/default.aspx"
+        #"https://www.moh.gov.sa/awarenessplateform/HealthyLifestyle/Pages/default.aspx",
+        #"https://www.moh.gov.sa/awarenessplateform/Firstaid/Pages/default.aspx",
+        #"https://www.moh.gov.sa/awarenessplateform/SeasonalAndFestivalHealth/Pages/default.aspx",
+        #"https://www.moh.gov.sa/awarenessplateform/WomensHealth/Pages/default.aspx",
+        #"https://www.moh.gov.sa/awarenessplateform/ElderlysHealth/Pages/default.aspx",
+        #"https://www.moh.gov.sa/awarenessplateform/ChildsHealth/Pages/default.aspx",
+        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx"
+        "https://www.moh.gov.sa/HealthAwareness/Beforemarriage/Pages/default.aspx",
+        #"https://www.moh.gov.sa/HealthAwareness/Pilgrims-Health/Pages/default.aspx",
+        #"https://www.moh.gov.sa/HealthAwareness/EducationalContent/Pages/default.aspx"
+
+        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=1",
+        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=2",
+        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=3",
+        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=4",
+        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=5",
+        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=6",
+        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=7",
+        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=8",
+        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=9",
+        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=10",
+        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=11",
+        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=12"
+        #"https://www.moh.gov.sa/AwarenessPlateform/ChronicDisease/Pages/default.aspx?PageIndex=2",
+        #"https://www.moh.gov.sa/AwarenessPlateform/ChronicDisease/Pages/default.aspx?PageIndex=3",
+        #"https://www.moh.gov.sa/AwarenessPlateform/ChronicDisease/Pages/default.aspx?PageIndex=4",
+
+        ]
+
+    for u in SEED_URLS: # for each link
+        queue.append(canonicalize_url(u)) # append to the queue defined to contain the URLs
+
+    pages = [] # create a list that will contain all the chunks for the web/web-PDF pages
+
+    print("\n🌍 Starting platform crawl...\n")
+
+    # start scrolling through the links queue
+    while queue and len(visited) < max_pages:
+
+        url = canonicalize_url(queue.popleft()) # start with the first inserted link, remove fragmentation
+
+        if url in visited: # test if previously visited, else append it to the visisted list
+            continue
+        visited.add(url)
+
+        print(f"\n🔎 Visiting: {url}")
+
+
+        if is_pdf(url): # test if it is a url for PDF, if yes send it to extract_pdf, then append the result to the pages list, next move to the following link in the queue
+            pdf_chunks = extract_pdf(url)
+            pages.extend(pdf_chunks)
+            continue
+
+
+        try: # if it wasn't PDF, send HTTP request to get the web page and through "Request failed" if response time exceeded 12 seconds
+            resp = requests.get(url, headers=HEADERS, timeout=12)
+        except:
+            print("⚠ Request failed")
+            continue
+
+        ctype = resp.headers.get("Content-Type", "").lower() # retrieve the content type of the recieved web page
+
+        if not any(t in ctype for t in VALID_CONTENT_TYPES): # test if the content type is of a valid type (HTML, or strict HTML), else skip it
+            print("⚠ Not HTML, skipped")
+            continue
+
+        html = resp.text # extract the text of the web-page
+        soup = BeautifulSoup(html, "html.parser") # parse the text using BeautifulSoup to build the parsing tree
+
+
+        text = extract_main_content(html) # send the parsed content to the extract_main_content
+        if text: # if text is not empty, add the chunk to the pages list
+            pages.append({
+			"id": make_uid(url),
+			"url": url,
+			"content": text,
+			"metadata": {
+			"type": "web_page",
+			"source": "MOH_AwarenessPlateform",
+			"page_url": url}})
+            print("📚 Stored text")
+        else:
+            print("⚠ Low-content page, skipped")
+
+
+        new_links = extract_links(soup, url) # send the link to extract_links to find embedded links
+
+        print(f"🔗 Found {len(new_links)} links")
+
+        for link in new_links: # if found and are not present in visited list, append them to the queue to be able to visit them
+            if link not in visited:
+                queue.append(link)
+
+        time.sleep(delay) # time pauses between each HTTP request to avoid overwhelming the server
+
+    print(f"\n🎉 Crawl completed → {len(pages)} items extracted.\n")
+    return pages
+
+
+
+# ============================================================
+#  Load URLs
+# ============================================================
+url_chunks = crawl_all_awareness()
+store_chunks_in_chroma(url_chunks, collection, embed_model, batch_size=128)
+
+# ============================================================
+#  Load PDF
+# ============================================================
+output_jsonl__pdf_path = r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\pdf_output.jsonl"
+pdf_chunks = chunk_pdf_pages(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\Dose-fo-Awareness-2.pdf", output_jsonl__pdf_path,normalize=True)
+store_chunks_in_chroma(pdf_chunks, collection, embed_model, batch_size=128)
+
+def read_jsonl_file(file_path):
+    data = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    json_object = json.loads(line)
+                    data.append(json_object)
+                except json.JSONDecodeError as e:
+                    print(f"Error decoding JSON on line: {line}. Error: {e}")
+    return data
+
+Firstaid = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\FirstAid_output.jsonl")
+PatientsRight = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\PatientsRight_output.jsonl")
+#OralHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\OralHealth_output.jsonl")
+#SeasonalAndFestivalHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\SeasonalAndFestivalHealth_output.jsonl")
+#WomensHealth = read_jsonl_file("r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\WomensHealth_output.jsonl")
+#ElderlysHealth = read_jsonl_file("r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\ElderlyHealth_output.jsonl")
+ChildsHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\ChildHealth_output.jsonl")
+#VariousTopics = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\VariousTopics_output.jsonl")
+ChronicDisease = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\ChronicDisease_output.jsonl")
+#EducationalContent = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\EducationalContent_output.jsonl")
+#Pilgrims_Health = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\Pilgrims_Health_output-Health.jsonl")
+#BeforeMarriage = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\BeforeMarriage_output.jsonl")
+pdf_output = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\pdf_output.jsonl")
+
+store_chunks_in_chroma(ChildsHealth, collection, embed_model, batch_size=128)
+#store_chunks_in_chroma(ElderlysHealth, collection, embed_model, batch_size=128)
+#store_chunks_in_chroma(EducationalContent, collection, embed_model, batch_size=128)
+store_chunks_in_chroma(Firstaid, collection, embed_model, batch_size=128)
+#store_chunks_in_chroma(OralHealth, collection, embed_model, batch_size=128)
+#store_chunks_in_chroma(PatientsRight, collection, embed_model, batch_size=128)
+#store_chunks_in_chroma(Pilgrims_Health, collection, embed_model, batch_size=128)
+#store_chunks_in_chroma(SeasonalAndFestivalHealth, collection, embed_model, batch_size=128)
+#store_chunks_in_chroma(VariousTopics, collection, embed_model, batch_size=128)
+#store_chunks_in_chroma(WomensHealth, collection, embed_model, batch_size=128)
+#store_chunks_in_chroma(pdf_output, collection, embed_model, batch_size=128)
+#store_chunks_in_chroma(BeforeMarriage, collection, embed_model, batch_size=128)
+store_chunks_in_chroma(ChronicDisease, collection, embed_model, batch_size=128)
+
+# ----------------------------
+# Helpers: Arabic check (optional gate for contexts)
+# ----------------------------
+ARABIC_CHAR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
+LETTER_OR_DIGIT_RE = re.compile(r"[A-Za-z0-9\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
+
+def is_arabic_chunk(text: str, min_arabic_chars: int = 30, min_arabic_ratio: float = 0.20) -> bool:
+    if not text or not text.strip():
+        return False
+    arabic_chars = ARABIC_CHAR_RE.findall(text)
+    if len(arabic_chars) < min_arabic_chars:
+        return False
+    letters_digits = LETTER_OR_DIGIT_RE.findall(text)
+    if not letters_digits:
+        return False
+    return (len(arabic_chars) / len(letters_digits)) >= min_arabic_ratio
+
+def rag_query(
+    query, collection, embed_model, reranker_tokenizer, reranker_model,
+    top_k=10,
+    overfetch=3,
+    min_rerank_score=None,          # set e.g. 0.0 or 1.0 if you want a gate
+    arabic_only=True,
+    min_arabic_chars=30,
+    min_arabic_ratio=0.20,
+):
+    # 1) query embedding
+    query_emb = embed_model.encode(
+        [query],
+        task="retrieval.query",
+        convert_to_numpy=True
+    )[0].tolist()
+
+    # 2) dense retrieve
+    search = collection.query(
+        query_embeddings=[query_emb],
+        n_results=top_k * overfetch,
+        include=["documents", "metadatas", "distances"]
     )
 
-    answer = response.choices[0].message.content
+    docs  = (search.get("documents") or [[]])[0]
+    metas = (search.get("metadatas") or [[]])[0]
 
-    # Remove any hallucinated "المصادر المستخدمة"
-    answer = re.split(r"المصادر المستخدمة\s*[:：]?", answer)[0].strip()
+    # 2.5) remove empties + optional Arabic filter
+    filtered = []
+    for d, m in zip(docs, metas):
+        if not d or not d.strip():
+            continue
+        if arabic_only and not is_arabic_chunk(d, min_arabic_chars, min_arabic_ratio):
+            continue
+        filtered.append((d, m or {}))
 
-    return answer
+    if not filtered:
+        return []
 
-def answer_question(question: str, top_k: int = 5) -> Tuple[str, List[Dict[str, Any]]]:
-    # Retrieve
-    chunks = retrieve_relevant_chunks(question, top_k=top_k)
+    docs = [d for d, _ in filtered]
+    metas = [m for _, m in filtered]
 
-    if not chunks:
-        return "لم أستطع إيجاد أي معلومات مرتبطة بسؤالك في قاعدة المعرفة.", []
+    # 2.6) dedupe by doc text (keeps first)
+    unique = {}
+    for d, m in zip(docs, metas):
+        if d not in unique:
+            unique[d] = m
+    docs = list(unique.keys())
+    metas = list(unique.values())
 
-    # Build prompt
-    prompt = build_prompt_arabic(question, chunks)
+    # 3) rerank
+    pairs = [[query, d] for d in docs]
+    tokens = reranker_tokenizer(
+        pairs,
+        padding=True,
+        truncation=True,
+        return_tensors="pt",
+        max_length=512
+    ).to(reranker_model.device)
 
-    # Generate
-    answer = generate_answer_from_llm(prompt)
+    with torch.no_grad():
+        scores = reranker_model(**tokens).logits.squeeze(-1).float().cpu().tolist()
 
-    return answer, chunks
+    ranked = sorted(zip(scores, docs, metas), key=lambda x: x[0], reverse=True)
 
-def extract_used_source_numbers(answer: str):
+    # 4) optional confidence gate (still returns consistent type)
+    if min_rerank_score is not None and ranked and ranked[0][0] < min_rerank_score:
+        return []
+
+    return ranked[:top_k]
+
+
+# ============================================================
+#  Query Test
+# ============================================================
+query = "ما معنى الإسعافات الأولية؟"
+results = rag_query(query, collection, embed_model, reranker_tokenizer,reranker_model, top_k=10)
+
+# Top matching results and scores
+for score, doc, meta in results[:5]:
+    print("\nSCORE:", float(score))
+    print("SOURCE:", meta.get("source"))
+    print("TEXT:", doc[:400])
+    print("-" * 60)
+
+# ============================================================
+#  LLM Setup
+# ============================================================
+
+if "OPENAI_API_KEY" in os.environ:
+    del os.environ["OPENAI_API_KEY"]
+
+os.environ["OPENAI_API_KEY"] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+print("API key updated.")
+client = OpenAI()
+
+# ============================================================
+#  Generate response from LLM
+# ============================================================
+
+def generate_rag_answer_with_citations(query, results):
     """
-    Extracts 'المصدر X' references from the model’s answer.
-    Returns a set of source numbers actually used.
+    Hallucination-resistant answer generator using only retrieved chunks.
     """
-    matches = re.findall(r"\(المصدر\s+(\d+)\)", answer)
-    return set(int(m) for m in matches)
+    if not results:
+        return "المعلومات المتوفرة لا تجيب عن السؤال مباشرة."
+    # ============================
+    # LIMIT CHUNKS TO TOP-1 or TOP-2
+    # ============================
+    max_chunks = 2
+    results = results[:max_chunks]
 
-q = "ما هي أعراض ألم ما بعد الولادة الطبيعية؟"
+    # ============================
+    # FORMAT CONTEXT + CITE SOURCES
+    # ============================
+    docs_context = []
+    source_map = {}
+    next_id = 1
 
-ans, retrieved_chunks = answer_question(q, top_k=5)
+    for i, (score, doc, meta) in enumerate(results, start=1):
 
-print("الإجابة:\n")
-print(ans)
-used_numbers = extract_used_source_numbers(ans)
+        # —— Determine citation label
+        if meta.get("type") == "PDF_page":
+            name = meta.get("source", "PDF")
+            label = f"PDF:{name}"
 
-print("\nالمصادر المستخدمة:")
-already_listed = set()
+        elif meta.get("type") == "web_page":
+            url = meta.get("page_url") or "UNKNOWN_URL"
+            label = f"URL:{url}"
 
-unique_sources = set()
+        else:
+            label = meta.get("source", "UNKNOWN")
 
-# CASE 1: Model cited sources
-if used_numbers:
-    for idx in sorted(used_numbers):
-        if 1 <= idx <= len(retrieved_chunks):
-            c = retrieved_chunks[idx - 1]
-            src = c['metadata'].get('title') or c['metadata'].get('source')
-            if src not in unique_sources:
-                print(f"- {src}")
-                unique_sources.add(src)
+        # —— Assign citation ID if new
+        if label not in source_map:
+            source_map[label] = next_id
+            next_id += 1
 
-# CASE 2: Model did NOT cite sources → fallback to unique retrieved sources
-else:
-    for c in retrieved_chunks:
-        src = c['metadata'].get('title') or c['metadata'].get('source')
-        if src not in unique_sources:
-            print(f"- {src}")
-            unique_sources.add(src)
+        cid = source_map[label]
+
+        # —— Build context fed to LLM
+        docs_context.append(f"[{cid}] {doc}")
+
+    context_text = "\n\n".join(docs_context)
+
+    # ============================
+    # ANTI-HALLUCINATION PROMPT
+    # ============================
+    prompt = f"""
+أنت مساعد طبي محترف، ودورك هو الإجابة فقط وفق النصوص المعطاة أدناه.
+
+❗ **قواعد صارمة يجب اتباعها:**
+1. لا تذكر أي معلومة غير موجودة داخل النصوص.
+2. إذا لم تُجب النصوص عن السؤال، قل: "المعلومات المتوفرة لا تجيب عن السؤال مباشرة."
+3. استخدم فقط الاستشهادات الخاصة بالنصوص مثل [1].
+4. امزج النصوص المتاحة دون إضافة معرفة خارجية.
+5. لا تضف أي مصادر إضافية غير التي تظهر في المقاطع.
+6. أجب بأنه لا يتوفر لديك معلومات إذا لم تجد إجابة للسؤال.
+7. لا تقدم أي معلومات إضافية خارج السياق.
+8.لا تذكر أي مرجع لم يُستخدم في كتابة نص الرد.
+9. أجب فقط من مصادر تحتوي على نص عربي
+السؤال:
+{query}
+
+النصوص المتاحة:
+{context_text}
+
+الجواب (مع الاستشهادات):
+"""
+
+
+    completion = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+    )
+
+    answer = completion.choices[0].message.content.strip()
+
+    # ============================
+    # BUILD CLEAN SOURCE LIST
+    # ============================
+    source_list = "📚 المصادر المستخدمة:\n"
+    for label, cid in source_map.items():
+
+        if label.startswith("URL:"):
+            url = label.replace("URL:", "")
+            source_list += f"- [{cid}] رابط: {url}\n"
+
+        elif label.startswith("PDF:"):
+            name = label.replace("PDF:", "")
+            source_list += f"- ملف PDF: {name} [{cid}]\n"
+
+        else:
+            source_list += f"- {label} [{cid}]\n"
+
+    return answer + "\n\n" + source_list
+
+# ============================================================
+#  Test RAG
+# ============================================================
+
+# final_answer = generate_rag_answer_with_citations(query, results)
+# print(final_answer)
+
+TELEGRAM_TOKEN = "xxxxxxxxxxxxxxxxxxx"
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "👋 أهلاً بك في مساعد الصحة الذكي.\n\n"
+        "اكتب سؤالاً صحياً مثل:\n"
+        "• ما أعراض ارتفاع ضغط الدم؟\n"
+        "• ما هي مضاعفات السكري؟\n"
+        "وسأبحث في قاعدة المعرفة ثم أجيبك مع ذكر المصادر."
+    )
+    await update.message.reply_text(msg)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    query = update.message.text.strip()
+
+    await update.message.reply_text("جاري معالجة السؤال ")
+
+    try:
+        # Use RAG query with Alibaba reranker
+        current_results = rag_query(
+            query=query,
+            collection=collection,
+            embed_model=embed_model,
+            reranker_tokenizer=reranker_tokenizer,
+            reranker_model=reranker_model,
+            top_k=10
+        )
+
+        if not current_results:
+          await update.message.reply_text("المعلومات المتوفرة لا تجيب عن السؤال مباشرة.")
+          return
+
+        response = generate_rag_answer_with_citations(query, current_results)
+
+    except Exception as e:
+        print(" Error:", e)
+        await update.message.reply_text("حدث خطأ أثناء الإجابة.")
+        return
+
+    await update.message.reply_text(response)
+def start_bot():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("🤖 RAG Telegram bot is running")
+    app.run_polling(drop_pending_updates=True)
+
+
+
+
+start_bot()
