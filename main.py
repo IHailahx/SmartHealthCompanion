@@ -36,6 +36,58 @@ from telegram.ext import (
     filters,
 )
 
+# Evaluation packages
+import pandas as pd
+from typing import List, Dict, Any, Tuple, Optional
+
+
+# ============================================================
+#  Helper Functions
+# ============================================================
+
+def save_jsonl(data, path):
+    with open(path, "w", encoding="utf-8") as f:
+        for item in data:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    print(f"\n✅ Saved {len(data)} chunks → {path}")
+
+def preview_jsonl(path, n=5, fields=None):
+    print(f"\n📄 Previewing first {n} entries from: {path}\n")
+
+    count = 0
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if count >= n:
+                break
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                print("❌ Skipped malformed JSON line.")
+                continue
+            if fields:
+                filtered = {k: item.get(k) for k in fields}
+                print(json.dumps(filtered, ensure_ascii=False, indent=2))
+            else:
+                print(json.dumps(item, ensure_ascii=False, indent=2))
+
+            print("-" * 60)
+            count += 1
+    if count == 0:
+        print("⚠️ No readable entries found.")
+
+def read_jsonl_file(file_path):
+    import json # Local import to prevent name shadowing
+    data = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    json_object = json.loads(line)
+                    data.append(json_object)
+                except json.JSONDecodeError as e:
+                    print(f"Error decoding JSON on line: {line}. Error: {e}")
+    return data
 
 # --------------------------------------------------------
 # OCR, Embedding and Reranker Models and Vector DB setup
@@ -83,7 +135,7 @@ def load_reranker_model(device="cuda"):
 # Content (documents): The raw data (usually text) that you want to store and embed. Documents are converted into numerical vector embeddings using an embedding function.
 # Metadata (metadatas): A dictionary of additional information associated with each document, used for filtering, categorizing, and providing context.
 # ---------------------------------
-def init_chroma_collection(path=r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\chroma_store", name="healthcare_rag_v2"):
+def init_chroma_collection(path=r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\chroma_store", name="healthcare_rag_v2"):
 
     client = chromadb.PersistentClient(path=path)
 
@@ -165,7 +217,7 @@ RE_DIACRITICS = re.compile(
 # Tatweel
 RE_TATWEEL = re.compile(r"\u0640")
 
-# All character not [Arabic or basic punctuation or whitespace or numbers or newlines]
+# All character not Arabic or basic punctuation or whitespace
 RE_NON_ARABIC = re.compile(
     fr"[^{ARABIC_BASE}\u0660-\u0669\u0030-\u0039\s\.,؛،؟?!\-\/]"
 )
@@ -232,7 +284,6 @@ def is_probable_arabic_heading(line: str) -> bool:
         # Common Arabic heading keywords
         if re.search(r"\b(الفصل|الباب|المبحث|المطلب|المسألة|تمهيد|مقدمة|خاتمة|الفرع|الجزء)\b", s):
             return True
-        # Numbered headings:  "أولاً" etc.
         if re.match(r"^\s*(أولاً|ثانياً|ثالثاً|رابعاً|خامساً|سادساً|سابعاً|ثامناً|تاسعاً|عاشراً)\b", s):
             return True
 
@@ -289,9 +340,9 @@ def split_arabic_sentences(text: str):
 
 def semantic_chunk_text_v2(
     text: str,
-    chunk_size: int = 600, # maximum full chunk size
+    chunk_size: int = 300, # maximum full chunk size
     overlap_sentences: int = 2, # number of sentences to overlap
-    max_sentence_len: int = 350, # maximum sentence length
+    max_sentence_len: int = 150, # maximum sentence length
 ):
 
     if not text or not text.strip(): # check if the text sent for chunking is empty, null, or consists of only whitespace
@@ -441,8 +492,7 @@ def chunk_pdf_pages(
     output_jsonl_path=None,
     normalize=True,
     min_chars=15,
-    chunk_size=600,
-    overlap=150
+    chunk_size=300
 ):
     pdf = fitz.open(input_pdf_path)
     chunks = []
@@ -474,7 +524,7 @@ def chunk_pdf_pages(
         page_chunks = semantic_chunk_text_v2(
             cleaned,
             chunk_size=chunk_size,
-            overlap_sentences=4
+            overlap_sentences=2
         )
 
         # store the final chunk into the chromadb
@@ -495,24 +545,12 @@ def chunk_pdf_pages(
 
         print(f"✅ Page {i+1}: {len(page_chunks)} semantic chunks created")
 
+    # Save JSONL if requested
+    if output_jsonl_path:
+        save_jsonl(chunks, output_jsonl_path)
 
     print(f"\n📦 Completed PDF extraction: {len(chunks)} chunks generated")
     return chunks
-
-# ============================================================
-#  Initialize models & vector DB
-# ============================================================
-if __name__ == "__main__":
-    # Load embedding model
-    embed_model = load_embedding_model()
-
-    # Load reranker (tokenizer + model)
-    reranker_tokenizer, reranker_model = load_reranker_model()
-
-    # Initialize Chroma collection
-    collection = init_chroma_collection()
-
-    print("\n✅ All models and vector database initialized successfully!")
 
 # ============================================================
 #  URL Loader
@@ -602,7 +640,7 @@ def is_valid_internal(url: str) -> bool:
         return False
 
     # Must be inside awareness platform
-    if "/healthawareness/beforemarriage/" not in path:# update to targeted path
+    if "/awarenessplateform/childshealth/" not in path:# update to selected targeted path
 
         return False
 
@@ -617,6 +655,25 @@ def is_valid_internal(url: str) -> bool:
 def is_pdf(url):
     return url.lower().endswith(".pdf")
 
+def extract_sharepoint_main_text_from_soup(soup: BeautifulSoup, min_len: int = 200) -> str:
+    selectors = [
+        "#ctl00_PlaceHolderMain_ctl02__ControlWrapper_RichHtmlField",  # MOH common
+        "#PageContent",
+        ".ms-rtestate-field",  # classic SharePoint rich text
+        "article",
+        "main",
+    ]
+
+    for sel in selectors:
+        node = soup.select_one(sel)
+        if not node:
+            continue
+
+        text = node.get_text(" ", strip=True)
+        if text and len(text) >= min_len:
+            return text
+
+    return ""
 
 #--------------------------------------------------
 # BeautifulSoup: a python library used for web scraping, creating a parse tree that allows for easy navigation,
@@ -626,50 +683,24 @@ def is_pdf(url):
 # if there is nothing related to SharePoint, check main tag for content, and return the cleaned version as the function output.
 # if there is nothing related to SharePoint and nothing in main tag, return  the cleaned version of whatever is present in the HTML as the function output.
 #--------------------------------------------------
-def extract_main_content(html):
+def extract_main_content(html: str, min_len: int = 200) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
-    # remove from the parsed tree all the tags that are not needed to be scraped.
-    for bad in ["script", "style", "header", "footer", "nav", "svg", "iframe"]:
+    # 1) Remove obvious junk / chrome
+    for bad in ["script", "style", "noscript", "svg", "iframe", "header", "footer", "nav"]:
         for t in soup.find_all(bad):
             t.decompose()
 
-    # Define a list of the styling classes that are commonly used to populate SharePoint content,
-    # if not available, then extract the article body from the HTML.
-    # e.g. for SharePoint content within HTML: <div class="ms-rtestate-field"> <p>This is SharePoint content.</p> </div>
-    # use select_one for CSS class to pick the first appearance of a content block.
-    # use find() since it exists once in each web-page, switchting to select_one will give the same but it will be a bit of an overhead on the parser.
-    # ms-rtestate-field, article__body, and : styling classes for SharePoint content
-    # check the text explanation at the bottom of this file for further explanation.
-    candidates = [
-        # Most MOH pages use this
-        soup.select_one(".ms-rtestate-field"),
+    # 2) Try SharePoint / main containers
+    text = extract_sharepoint_main_text_from_soup(soup, min_len=min_len)
+    if text:
+        return normalize_arabic_text(text)
 
-        # Alternative block
-        soup.select_one(".article__body"),
+    # 3) Fallback: body text
+    if soup.body:
+        return normalize_arabic_text(soup.body.get_text(" ", strip=True))
 
-        # ID used in some disease categories
-        soup.select_one("#ctl00_PlaceHolderMain_ContentMain"),
-
-        # Fallback main container for some templates, last hope to extract SharePoint if exists
-        soup.select_one(".contentPage"),
-
-        # Some pages wrap content inside article tags
-        soup.find("article"),
-    ]
-
-    # Extract text from extracted objects containing SharePoint content and sending it to normalize_arabic_text
-    for c in candidates:
-        if c and c.get_text(strip=True):
-            text = c.get_text(" ", strip=True)
-            return normalize_arabic_text(text)
-
-    # If there was no SharePoint content returned, check the main tag for content
-    main_tag = soup.find("main")
-    if main_tag:
-        return normalize_arabic_text(main_tag.get_text(" ", strip=True))
-
-    # last hope
+    # 4) Last resort
     return normalize_arabic_text(soup.get_text(" ", strip=True))
 
 #--------------------------------------------------
@@ -682,7 +713,7 @@ def extract_pdf(
     normalize=True,
     min_chars=20,
     min_arabic_chars=10,
-    chunk_size=600,
+    chunk_size=300,
     overlap_sentences=2,
 ):
     print(f"📄 PDF → {url}")
@@ -822,34 +853,18 @@ def crawl_all_awareness(max_pages=1500, delay=0.15):
 
     SEED_URLS = [
         #"https://www.moh.gov.sa/AwarenessPlateform/ChronicDisease/Pages/default.aspx?PageIndex=1",
-        #"https://www.moh.gov.sa/awarenessplateform/Patientsrights/Pages/default.aspx"
-        #"https://www.moh.gov.sa/awarenessplateform/OralHealth/Pages/default.aspx"
-        #"https://www.moh.gov.sa/awarenessplateform/HealthyLifestyle/Pages/default.aspx",
-        #"https://www.moh.gov.sa/awarenessplateform/Firstaid/Pages/default.aspx",
-        #"https://www.moh.gov.sa/awarenessplateform/SeasonalAndFestivalHealth/Pages/default.aspx",
-        #"https://www.moh.gov.sa/awarenessplateform/WomensHealth/Pages/default.aspx",
-        #"https://www.moh.gov.sa/awarenessplateform/ElderlysHealth/Pages/default.aspx",
-        #"https://www.moh.gov.sa/awarenessplateform/ChildsHealth/Pages/default.aspx",
-        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx"
-        "https://www.moh.gov.sa/HealthAwareness/Beforemarriage/Pages/default.aspx",
-        #"https://www.moh.gov.sa/HealthAwareness/Pilgrims-Health/Pages/default.aspx",
-        #"https://www.moh.gov.sa/HealthAwareness/EducationalContent/Pages/default.aspx"
-
-        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=1",
-        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=2",
-        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=3",
-        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=4",
-        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=5",
-        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=6",
-        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=7",
-        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=8",
-        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=9",
-        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=10",
-        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=11",
-        #"https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx?PageIndex=12"
-        #"https://www.moh.gov.sa/AwarenessPlateform/ChronicDisease/Pages/default.aspx?PageIndex=2",
-        #"https://www.moh.gov.sa/AwarenessPlateform/ChronicDisease/Pages/default.aspx?PageIndex=3",
-        #"https://www.moh.gov.sa/AwarenessPlateform/ChronicDisease/Pages/default.aspx?PageIndex=4",
+        # "https://www.moh.gov.sa/awarenessplateform/Patientsrights/Pages/default.aspx"
+        # "https://www.moh.gov.sa/awarenessplateform/OralHealth/Pages/default.aspx"
+        # "https://www.moh.gov.sa/awarenessplateform/HealthyLifestyle/Pages/default.aspx",
+        # "https://www.moh.gov.sa/awarenessplateform/Firstaid/Pages/default.aspx",
+        # "https://www.moh.gov.sa/awarenessplateform/SeasonalAndFestivalHealth/Pages/default.aspx",
+        # "https://www.moh.gov.sa/awarenessplateform/WomensHealth/Pages/default.aspx",
+        # "https://www.moh.gov.sa/awarenessplateform/ElderlysHealth/Pages/default.aspx",
+        # "https://www.moh.gov.sa/awarenessplateform/ChildsHealth/Pages/default.aspx",
+        # "https://www.moh.gov.sa/awarenessplateform/VariousTopics/Pages/default.aspx"
+        # "https://www.moh.gov.sa/HealthAwareness/Beforemarriage/Pages/default.aspx",
+        # "https://www.moh.gov.sa/HealthAwareness/Pilgrims-Health/Pages/default.aspx",
+        # "https://www.moh.gov.sa/HealthAwareness/EducationalContent/Pages/default.aspx"
 
         ]
 
@@ -925,62 +940,67 @@ def crawl_all_awareness(max_pages=1500, delay=0.15):
 
 
 # ============================================================
+#  Initialize models & vector DB
+# ============================================================
+if __name__ == "__main__":
+    # Load embedding model
+    embed_model = load_embedding_model()
+
+    # Load reranker (tokenizer + model)
+    reranker_tokenizer, reranker_model = load_reranker_model()
+
+    # Initialize Chroma collection
+    collection = init_chroma_collection()
+
+    print("\n✅ All models and vector database initialized successfully!")
+
+# ============================================================
 #  Load URLs
 # ============================================================
 url_chunks = crawl_all_awareness()
 store_chunks_in_chroma(url_chunks, collection, embed_model, batch_size=128)
+save_jsonl(url_chunks,r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\ChildHealth.jsonl")
 
 # ============================================================
 #  Load PDF
 # ============================================================
-output_jsonl__pdf_path = r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\pdf_output.jsonl"
-pdf_chunks = chunk_pdf_pages(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\Dose-fo-Awareness-2.pdf", output_jsonl__pdf_path,normalize=True)
+output_jsonl__pdf_path = r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\pdf_output.jsonl"
+pdf_chunks = chunk_pdf_pages(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\Dose-fo-Awareness-2.pdf", output_jsonl__pdf_path,normalize=True)
 store_chunks_in_chroma(pdf_chunks, collection, embed_model, batch_size=128)
 
-def read_jsonl_file(file_path):
-    data = []
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    json_object = json.loads(line)
-                    data.append(json_object)
-                except json.JSONDecodeError as e:
-                    print(f"Error decoding JSON on line: {line}. Error: {e}")
-    return data
+# ChildsHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\ChildHealth.jsonl")
+# ElderlysHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\ElderlyHealth.jsonl")
+# Firstaid = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\FirstAid.jsonl")
+# HealthyLifeStyle = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\HealthyLifestyle.jsonl")
+# OralHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\OralHealth.jsonl")
+# PatientsRight = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\PatientRight.jsonl")
+# Pilgrims_Health = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\Pilgrims_Health.jsonl")
+# SeasonalAndFestivalHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\SeasonalFestivalHealth.jsonl")
+# VariousTopics = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\VariousTopic.jsonl")
+# WomensHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\WomenHealth.jsonl")
+# BeforeMarriage = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\BeforeMarriage.jsonl")
+# ChronicDisease = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\ChronicDisease.jsonl")
+# EducationalContent = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\EducationalContent.jsonl")
 
-Firstaid = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\FirstAid_output.jsonl")
-PatientsRight = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\PatientsRight_output.jsonl")
-#OralHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\OralHealth_output.jsonl")
-#SeasonalAndFestivalHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\SeasonalAndFestivalHealth_output.jsonl")
-#WomensHealth = read_jsonl_file("r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\WomensHealth_output.jsonl")
-#ElderlysHealth = read_jsonl_file("r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\ElderlyHealth_output.jsonl")
-ChildsHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\ChildHealth_output.jsonl")
-#VariousTopics = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\VariousTopics_output.jsonl")
-ChronicDisease = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\ChronicDisease_output.jsonl")
-#EducationalContent = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\EducationalContent_output.jsonl")
-#Pilgrims_Health = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\Pilgrims_Health_output-Health.jsonl")
-#BeforeMarriage = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\BeforeMarriage_output.jsonl")
-pdf_output = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Final\Data\pdf_output.jsonl")
 
-store_chunks_in_chroma(ChildsHealth, collection, embed_model, batch_size=128)
-#store_chunks_in_chroma(ElderlysHealth, collection, embed_model, batch_size=128)
-#store_chunks_in_chroma(EducationalContent, collection, embed_model, batch_size=128)
-store_chunks_in_chroma(Firstaid, collection, embed_model, batch_size=128)
-#store_chunks_in_chroma(OralHealth, collection, embed_model, batch_size=128)
-#store_chunks_in_chroma(PatientsRight, collection, embed_model, batch_size=128)
-#store_chunks_in_chroma(Pilgrims_Health, collection, embed_model, batch_size=128)
-#store_chunks_in_chroma(SeasonalAndFestivalHealth, collection, embed_model, batch_size=128)
-#store_chunks_in_chroma(VariousTopics, collection, embed_model, batch_size=128)
-#store_chunks_in_chroma(WomensHealth, collection, embed_model, batch_size=128)
-#store_chunks_in_chroma(pdf_output, collection, embed_model, batch_size=128)
-#store_chunks_in_chroma(BeforeMarriage, collection, embed_model, batch_size=128)
-store_chunks_in_chroma(ChronicDisease, collection, embed_model, batch_size=128)
+# store_chunks_in_chroma(ChildsHealth, collection, embed_model, batch_size=128)
+# store_chunks_in_chroma(ElderlysHealth, collection, embed_model, batch_size=128)
+# store_chunks_in_chroma(Firstaid, collection, embed_model, batch_size=128)
+# store_chunks_in_chroma(HealthyLifeStyle, collection, embed_model, batch_size=128)
+# store_chunks_in_chroma(OralHealth, collection, embed_model, batch_size=128)
+# store_chunks_in_chroma(PatientsRight, collection, embed_model, batch_size=128)
+# store_chunks_in_chroma(Pilgrims_Health, collection, embed_model, batch_size=128)
+# store_chunks_in_chroma(SeasonalAndFestivalHealth, collection, embed_model, batch_size=128)
+# store_chunks_in_chroma(VariousTopics, collection, embed_model, batch_size=128)
+# store_chunks_in_chroma(WomensHealth, collection, embed_model, batch_size=128)
+# store_chunks_in_chroma(BeforeMarriage, collection, embed_model, batch_size=128)
+# store_chunks_in_chroma(ChronicDisease, collection, embed_model, batch_size=128)
+# store_chunks_in_chroma(EducationalContent, collection, embed_model, batch_size=128)
 
 # ----------------------------
 # Helpers: Arabic check (optional gate for contexts)
 # ----------------------------
+
 ARABIC_CHAR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
 LETTER_OR_DIGIT_RE = re.compile(r"[A-Za-z0-9\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
 
@@ -997,7 +1017,7 @@ def is_arabic_chunk(text: str, min_arabic_chars: int = 30, min_arabic_ratio: flo
 
 def rag_query(
     query, collection, embed_model, reranker_tokenizer, reranker_model,
-    top_k=10,
+    top_k=3,
     overfetch=3,
     min_rerank_score=None,          # set e.g. 0.0 or 1.0 if you want a gate
     arabic_only=True,
@@ -1026,8 +1046,6 @@ def rag_query(
     for d, m in zip(docs, metas):
         if not d or not d.strip():
             continue
-        if arabic_only and not is_arabic_chunk(d, min_arabic_chars, min_arabic_ratio):
-            continue
         filtered.append((d, m or {}))
 
     if not filtered:
@@ -1051,7 +1069,7 @@ def rag_query(
         padding=True,
         truncation=True,
         return_tensors="pt",
-        max_length=512
+        max_length=1024
     ).to(reranker_model.device)
 
     with torch.no_grad():
@@ -1069,8 +1087,8 @@ def rag_query(
 # ============================================================
 #  Query Test
 # ============================================================
-query = "ما معنى الإسعافات الأولية؟"
-results = rag_query(query, collection, embed_model, reranker_tokenizer,reranker_model, top_k=10)
+query = "ما هو علاج التبول اللاإرادي عند الأطفال؟"
+results = rag_query(query, collection, embed_model, reranker_tokenizer,reranker_model, top_k=3)
 
 # Top matching results and scores
 for score, doc, meta in results[:5]:
@@ -1086,7 +1104,7 @@ for score, doc, meta in results[:5]:
 if "OPENAI_API_KEY" in os.environ:
     del os.environ["OPENAI_API_KEY"]
 
-os.environ["OPENAI_API_KEY"] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+os.environ["OPENAI_API_KEY"] = "xxxxxxxxxxxxxxxxxxxxxxxxx"
 
 print("API key updated.")
 client = OpenAI()
@@ -1095,6 +1113,13 @@ client = OpenAI()
 #  Generate response from LLM
 # ============================================================
 
+def extract_citation_ids(text: str) -> set[int]:
+    # matches [1], [12], etc. (and avoids [[]] edge cases)
+    ids = set()
+    for m in re.finditer(r"\[(\d{1,3})\]", text):
+        ids.add(int(m.group(1)))
+    return ids
+
 def generate_rag_answer_with_citations(query, results):
     """
     Hallucination-resistant answer generator using only retrieved chunks.
@@ -1102,9 +1127,9 @@ def generate_rag_answer_with_citations(query, results):
     if not results:
         return "المعلومات المتوفرة لا تجيب عن السؤال مباشرة."
     # ============================
-    # LIMIT CHUNKS TO TOP-1 or TOP-2
+    # LIMIT CHUNKS TO TOP-3
     # ============================
-    max_chunks = 2
+    max_chunks = 3
     results = results[:max_chunks]
 
     # ============================
@@ -1154,7 +1179,7 @@ def generate_rag_answer_with_citations(query, results):
 5. لا تضف أي مصادر إضافية غير التي تظهر في المقاطع.
 6. أجب بأنه لا يتوفر لديك معلومات إذا لم تجد إجابة للسؤال.
 7. لا تقدم أي معلومات إضافية خارج السياق.
-8.لا تذكر أي مرجع لم يُستخدم في كتابة نص الرد.
+8.لا تذكر أي مرجع لم تستخدمه في كتابة الرد.
 9. أجب فقط من مصادر تحتوي على نص عربي
 السؤال:
 {query}
@@ -1173,32 +1198,540 @@ def generate_rag_answer_with_citations(query, results):
     )
 
     answer = completion.choices[0].message.content.strip()
+    used_cids = extract_citation_ids(answer)
 
-    # ============================
-    # BUILD CLEAN SOURCE LIST
-    # ============================
-    source_list = "📚 المصادر المستخدمة:\n"
-    for label, cid in source_map.items():
+# If the model returned no citations at all, you can choose:
+# - either show none, or
+# - show all, or
+# - enforce at least one citation if it answered.
+# I'd recommend showing none to match your rule #8.
+    source_list = "### 📚 المصادر المستخدمة:\n"
 
-        if label.startswith("URL:"):
-            url = label.replace("URL:", "")
-            source_list += f"- [{cid}] رابط: {url}\n"
+# Build an inverse map cid -> label (because your current map is label -> cid)
+    cid_to_label = {cid: label for label, cid in source_map.items()}
 
-        elif label.startswith("PDF:"):
-            name = label.replace("PDF:", "")
-            source_list += f"- ملف PDF: {name} [{cid}]\n"
+    for cid in sorted(used_cids):
+      label = cid_to_label.get(cid)
+      if not label:
+        continue
 
-        else:
-            source_list += f"- {label} [{cid}]\n"
+      if label.startswith("URL:"):
+        url = label.replace("URL:", "")
+        source_list += f"- [{cid}] رابط: {url}\n"
+      elif label.startswith("PDF:"):
+        name = label.replace("PDF:", "")
+        source_list += f"- ملف PDF: {name} [{cid}]\n"
+      else:
+        source_list += f"- {label} [{cid}]\n"
 
-    return answer + "\n\n" + source_list
+# If nothing was used, don't show an empty sources section
+    if used_cids:
+      return answer + "\n\n" + source_list
+    else:
+      return answer
+
 
 # ============================================================
 #  Test RAG
 # ============================================================
+#final_answer = generate_rag_answer_with_citations(query, results)
+#print(final_answer)
 
-# final_answer = generate_rag_answer_with_citations(query, results)
-# print(final_answer)
+from urllib.parse import urlparse
+
+def canonicalize_url_simple(url: str) -> str:
+    p = urlparse(url.strip())
+    query = f"?{p.query}" if p.query else ""
+    return f"{p.scheme}://{p.netloc}{p.path}{query}".split("#")[0]
+
+def meta_to_reference(meta: dict) -> str:
+    meta = meta or {}
+    t = meta.get("type")
+
+    if t == "web_page":
+        u = meta.get("page_url") or meta.get("url") or ""
+        return "URL:" + canonicalize_url_simple(u) if u else "URL:UNKNOWN"
+
+    if t == "PDF_page":
+        name = meta.get("source", "PDF")
+        page = meta.get("page", None)
+        return f"PDF:{name}:p{int(page)}" if page is not None else f"PDF:{name}"
+
+    return f"SRC:{meta.get('source','UNKNOWN')}"
+
+
+def export_top_sources_for_annotation(
+    questions_excel: str,
+    out_excel: str,
+    pool_chunks: int = 30,     # pull more chunks to ensure you get 10 unique sources
+    target_unique_sources: int = 10
+):
+    df = pd.read_excel(questions_excel)
+    rows = []
+
+    for _, r in df.iterrows():
+        qid = r["qid"]
+        q = str(r["question"])
+
+        # pull a wider chunk pool then dedupe by source
+        results = rag_query(
+            q, collection, embed_model, reranker_tokenizer, reranker_model,
+            top_k=pool_chunks,
+            overfetch=5,
+            arabic_only=True
+        )
+
+        seen = set()
+        unique_count = 0
+
+        for rank, (score, chunk, meta) in enumerate(results, start=1):
+            ref = meta_to_reference(meta)
+            if ref in seen:
+                continue
+            seen.add(ref)
+            unique_count += 1
+
+            rows.append({
+                "qid": qid,
+                "question": q,
+                "pool_rank": rank,         # rank among chunks
+                "reference": ref,          # <-- gold unit you mark
+                "rerank_score": float(score),
+                "page_url": (meta or {}).get("page_url"),
+                "source": (meta or {}).get("source"),
+                "page": (meta or {}).get("page"),
+                "example_chunk": chunk[:500],
+                "is_gold": "",             # you fill 1/0
+                "notes": ""
+            })
+
+            if unique_count >= target_unique_sources:
+                break
+
+    pd.DataFrame(rows).to_excel(out_excel, index=False)
+    print("Saved:", out_excel)
+
+export_top_sources_for_annotation(
+    questions_excel=r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\questions.xlsx",
+    out_excel=r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\top10_sources_for_gold.xlsx",
+    pool_chunks=30,
+    target_unique_sources=10
+)
+
+
+def load_gold_sources(marked_excel: str) -> dict:
+    df = pd.read_excel(marked_excel)
+    df = df[df["is_gold"] == 1]
+    gold = {}
+    for qid, g in df.groupby("qid"):
+        gold[qid] = set(g["reference"].astype(str).tolist())
+    return gold
+
+def evaluate_hit_mrr_at_3(
+    questions_excel: str,
+    marked_gold_excel: str,
+    out_excel: str
+):
+    df = pd.read_excel(questions_excel)
+    gold = load_gold_sources(marked_gold_excel)
+
+    rows = []
+    for _, r in df.iterrows():
+        qid = r["qid"]
+        q = str(r["question"])
+        gold_refs = gold.get(qid, set())
+
+        res = rag_query(
+            q, collection, embed_model, reranker_tokenizer, reranker_model,
+            top_k=3,
+            overfetch=5,
+            arabic_only=True
+        )
+
+        retrieved_refs = []
+        seen = set()
+        for _, _, meta in res:
+            ref = meta_to_reference(meta)
+            if ref not in seen:
+                retrieved_refs.append(ref)
+                seen.add(ref)
+
+        hit3 = 0
+        mrr3 = 0.0
+        for i, ref in enumerate(retrieved_refs[:3], start=1):
+            if ref in gold_refs:
+                hit3 = 1
+                mrr3 = 1.0 / i
+                break
+
+        rows.append({
+            "qid": qid,
+            "num_gold_refs": len(gold_refs),
+            "hit@3": hit3,
+            "mrr@3": mrr3,
+            "retrieved_top3": ";".join(retrieved_refs)
+        })
+
+    out_df = pd.DataFrame(rows)
+    summary = {
+        "Hit@3": out_df["hit@3"].mean(),
+        "MRR@3": out_df["mrr@3"].mean(),
+        "Avg # gold refs": out_df["num_gold_refs"].mean()
+    }
+
+    with pd.ExcelWriter(out_excel, engine="openpyxl") as w:
+        out_df.to_excel(w, index=False, sheet_name="per_question")
+        pd.DataFrame([summary]).to_excel(w, index=False, sheet_name="summary")
+
+    print("Saved:", out_excel)
+
+
+evaluate_hit_mrr_at_3(
+    questions_excel=r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\questions.xlsx",
+    marked_gold_excel=r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\top10_sources_for_gold.xlsx",
+    out_excel=r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\eval_hit3.xlsx"
+)
+
+
+def citation_validity(answer: str, n_ctx: int) -> dict:
+    used = extract_citation_ids(answer)
+    if not used:
+        return {"valid": False, "used": [], "invalid": [], "notes": "No citations used."}
+    invalid = sorted([c for c in used if c < 1 or c > n_ctx])
+    return {
+        "valid": len(invalid) == 0,
+        "used": sorted(list(used)),
+        "invalid": invalid,
+        "notes": "" if len(invalid) == 0 else f"Out of range citations: {invalid}"
+    }
+
+def extract_citation_ids(text: str) -> set[int]:
+  # matches [1], [12], etc. (and avoids [[]] edge cases)
+  ids = set()
+  for m in re.finditer(r"\[(\d{1,3})\]", text):
+    ids.add(int(m.group(1)))
+  return ids
+
+
+import pandas as pd
+import json
+import time
+from typing import List, Dict, Any, Tuple
+
+# ----------------------------
+# Config
+# ----------------------------
+EVAL_XLSX_PATH = r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\EvaluationForGeneration.xlsx"
+OUT_CSV_PATH = r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\rag_generation_judge_report.csv"
+
+JUDGE_MODEL = "gpt-4o-mini"
+MAX_RETRIES = 3
+SLEEP_BETWEEN = 1.5
+
+TOP_K_RETRIEVAL = 3          # retrieval window
+GEN_MAX_CHUNKS = 3           # contexts fed to judge (must match generator)
+
+ABSTAIN_PHRASES = [
+    "المعلومات المتوفرة لا تجيب عن السؤال مباشرة",
+    "لا تتوفر معلومات كافية للإجابة",
+]
+
+# ----------------------------
+# Helpers: parse gold sources from your sheet
+# column "reference" is a JSON list string
+# ----------------------------
+def parse_reference_cell(x) -> List[str]:
+    if x is None:
+        return []
+    s = str(x).strip()
+    if not s:
+        return []
+    try:
+        v = json.loads(s)
+        if isinstance(v, list):
+            return [str(i).strip() for i in v if str(i).strip()]
+    except Exception:
+        pass
+    # fallback: allow ; separated
+    return [p.strip() for p in s.split(";") if p.strip()]
+
+# ----------------------------
+# Strip appended sources list from your generator output
+# ----------------------------
+def split_answer_and_sources(full_text: str) -> Tuple[str, str]:
+    marker = "### 📚 المصادر المستخدمة:"
+    if marker in (full_text or ""):
+        ans, src = full_text.split(marker, 1)
+        return ans.strip(), (marker + src).strip()
+    return (full_text or "").strip(), ""
+
+def did_abstain(answer: str) -> bool:
+    a = (answer or "").strip()
+    return any(p in a for p in ABSTAIN_PHRASES)
+
+# ----------------------------
+# Deterministic citation validity (consistent with top-3 contexts)
+# Requires your extract_citation_ids(answer) function
+# ----------------------------
+def citation_validity(answer: str, n_ctx: int) -> Dict[str, Any]:
+    used = extract_citation_ids(answer or "")
+    if not used:
+        return {"valid": False, "used": [], "invalid": [], "notes": "No citations found."}
+    invalid = sorted([c for c in used if c < 1 or c > n_ctx])
+    return {
+        "valid": len(invalid) == 0,
+        "used": sorted(list(used)),
+        "invalid": invalid,
+        "notes": "" if not invalid else f"Out-of-range citations: {invalid}"
+    }
+
+# ----------------------------
+# Judge (LLM-as-judge)
+# IMPORTANT: contexts are labeled [1],[2],[3] to match your citation style
+# ----------------------------
+def judge_rag_answer(question: str, answer: str, contexts: List[str], model: str = JUDGE_MODEL) -> Dict[str, Any]:
+    trimmed = [c[:2500] for c in contexts]
+    context_text = "\n\n".join([f"[{i+1}] {c}" for i, c in enumerate(trimmed)])
+
+    prompt = f"""
+أنت مقيّم جودة لإجابات نظام RAG طبي عربي.
+يجب أن تقيم الإجابة اعتماداً على النصوص المعطاة فقط، ولا تستخدم أي معرفة خارجية.
+
+قيّم الإجابة عبر 4 محاور:
+
+1) Faithfulness/Groundedness:
+- هل كل الادعاءات في الإجابة مدعومة صراحة من النصوص [1..]؟
+- إذا وُجدت أي معلومة غير مدعومة، اذكرها في unsupported_claims.
+- passed=true فقط إذا كانت جميع الادعاءات مدعومة من النصوص.
+
+2) Answer Relevance:
+- هل الإجابة تجيب عن السؤال مباشرة؟
+
+3) Contextual Correctness:
+- هل الإجابة صحيحة "بالنسبة للنصوص"؟ (لا تفترض معلومات خارج النصوص)
+- critical_error=true إذا تضمنت الإجابة نصيحة قد تكون خطرة أو مضللة مقارنة بما ورد في النصوص.
+
+4) Fluency/Readability:
+- سلامة اللغة العربية ووضوحها.
+
+مقياس الدرجات لكل محور: 1 (سيئ جداً) إلى 5 (ممتاز).
+
+أعد JSON فقط بهذا الشكل (بدون أي نص إضافي):
+
+{{
+  "faithfulness": {{"score": 1, "passed": false, "unsupported_claims": [], "notes": ""}},
+  "relevance": {{"score": 1, "notes": ""}},
+  "correctness": {{"score": 1, "critical_error": false, "notes": ""}},
+  "fluency": {{"score": 1, "notes": ""}}
+}}
+
+السؤال:
+{question}
+
+الإجابة:
+{answer}
+
+النصوص:
+{context_text}
+"""
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "أنت مقيّم صارم ومحايد. أعد JSON فقط بدون أي شرح خارج JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0
+    )
+
+    raw = resp.choices[0].message.content.strip().strip("`").strip()
+    if raw.lower().startswith("json"):
+        raw = raw[4:].strip()
+
+    try:
+        j = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            j = json.loads(raw[start:end+1])
+        else:
+            raise
+
+    for k in ["faithfulness", "relevance", "correctness", "fluency"]:
+        if k not in j:
+            raise ValueError(f"Judge JSON missing key: {k}. Raw head: {raw[:200]}")
+    return j
+
+# ----------------------------
+# Run your RAG for one question (top-3)
+# Also compute retrieved source references for gold matching
+# ----------------------------
+def run_rag_fn(question: str) -> Dict[str, Any]:
+    results = rag_query(
+        query=question,
+        collection=collection,
+        embed_model=embed_model,
+        reranker_tokenizer=reranker_tokenizer,
+        reranker_model=reranker_model,
+        top_k=TOP_K_RETRIEVAL,
+        overfetch=5,
+        arabic_only=True
+    )
+
+    if not results:
+        return {"answer": "لا تتوفر معلومات كافية للإجابة.", "contexts": [], "sources": [], "raw_results": []}
+
+    # contexts (exactly what judge sees)
+    top_for_generation = results[:GEN_MAX_CHUNKS]
+    contexts = [doc for (_, doc, _) in top_for_generation]
+
+    # compute source refs from metas
+    sources = []
+    seen = set()
+    for (_, _, meta) in top_for_generation:
+        ref = meta_to_reference(meta)
+        if ref not in seen:
+            sources.append(ref)
+            seen.add(ref)
+
+    full_answer = generate_rag_answer_with_citations(question, results)
+    answer_text, sources_text = split_answer_and_sources(full_answer)
+
+    return {
+        "answer": answer_text,
+        "sources_text": sources_text,
+        "contexts": contexts,
+        "sources": sources,
+        "raw_results": top_for_generation
+    }
+
+# ----------------------------
+# Main evaluation loop (Excel)
+# ----------------------------
+def evaluate_generation_from_excel() -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    df_eval = pd.read_excel(EVAL_XLSX_PATH)
+
+    required = {"qid", "question", "answerable", "reference"}
+    missing = required - set(df_eval.columns)
+    if missing:
+        raise ValueError(f"Missing columns in evaluation sheet: {missing}")
+
+    records = []
+    for idx, row in df_eval.iterrows():
+        qid = row["qid"]
+        q = str(row["question"]).strip()
+        answerable = int(row["answerable"])
+        gold_sources = set(parse_reference_cell(row["reference"]))
+
+        rag_out = run_rag_fn(q)
+        answer = rag_out["answer"]
+        contexts = rag_out["contexts"]
+        retrieved_sources = set(rag_out["sources"])
+
+        abstained = did_abstain(answer)
+        abstention_correct = (abstained and answerable == 0) or ((not abstained) and answerable == 1)
+
+        used_gold_source = None
+        if gold_sources:
+            used_gold_source = len(gold_sources.intersection(retrieved_sources)) > 0
+
+        cite_check = citation_validity(answer, n_ctx=len(contexts))
+
+        # Judge with retries
+        judgement, last_err = None, ""
+        for attempt in range(MAX_RETRIES):
+            try:
+                judgement = judge_rag_answer(q, answer, contexts, model=JUDGE_MODEL)
+                break
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(SLEEP_BETWEEN * (attempt + 1))
+
+        if judgement is None:
+            records.append({
+                "qid": qid,
+                "question": q,
+                "answerable": answerable,
+                "abstained": abstained,
+                "abstention_correct": abstention_correct,
+                "used_gold_source": used_gold_source,
+                "retrieved_sources": ";".join(sorted(retrieved_sources)),
+                "gold_sources": ";".join(sorted(gold_sources)),
+                "answer": answer,
+                "citation_valid": cite_check["valid"],
+                "citation_used": ",".join(map(str, cite_check["used"])),
+                "citation_invalid": ",".join(map(str, cite_check["invalid"])),
+                "faithfulness_score": None,
+                "faithfulness_passed": None,
+                "unsupported_claims": None,
+                "relevance_score": None,
+                "correctness_score": None,
+                "critical_error": None,
+                "fluency_score": None,
+                "judge_notes": None,
+                "judge_error": last_err
+            })
+            continue
+
+        records.append({
+            "qid": qid,
+            "question": q,
+            "answerable": answerable,
+            "abstained": abstained,
+            "abstention_correct": abstention_correct,
+            "used_gold_source": used_gold_source,
+            "retrieved_sources": ";".join(sorted(retrieved_sources)),
+            "gold_sources": ";".join(sorted(gold_sources)),
+            "answer": answer,
+            "citation_valid": cite_check["valid"],
+            "citation_used": ",".join(map(str, cite_check["used"])),
+            "citation_invalid": ",".join(map(str, cite_check["invalid"])),
+            "faithfulness_score": judgement["faithfulness"]["score"],
+            "faithfulness_passed": judgement["faithfulness"]["passed"],
+            "unsupported_claims": " | ".join(judgement["faithfulness"]["unsupported_claims"]),
+            "relevance_score": judgement["relevance"]["score"],
+            "correctness_score": judgement["correctness"]["score"],
+            "critical_error": judgement["correctness"]["critical_error"],
+            "fluency_score": judgement["fluency"]["score"],
+            "judge_notes": (
+                f"F:{judgement['faithfulness']['notes']} | "
+                f"R:{judgement['relevance']['notes']} | "
+                f"C:{judgement['correctness']['notes']} | "
+                f"L:{judgement['fluency']['notes']}"
+            ),
+            "judge_error": ""
+        })
+
+        if (idx + 1) % 10 == 0:
+            print(f"✅ Evaluated {idx+1}/{len(df_eval)}")
+
+    df_out = pd.DataFrame(records)
+
+    ok = df_out[df_out["faithfulness_score"].notna()]
+    summary = {
+        "n_total": int(len(df_out)),
+        "n_scored": int(len(ok)),
+        "citation_valid_rate": float(df_out["citation_valid"].mean()),
+        "abstention_accuracy": float(df_out["abstention_correct"].mean()),
+        "gold_source_covered_rate": float(ok["used_gold_source"].mean()) if "used_gold_source" in ok.columns else None,
+        "faithfulness_pass_rate": float(ok["faithfulness_passed"].mean()) if len(ok) else 0.0,
+        "avg_faithfulness": float(ok["faithfulness_score"].mean()) if len(ok) else 0.0,
+        "avg_relevance": float(ok["relevance_score"].mean()) if len(ok) else 0.0,
+        "avg_correctness": float(ok["correctness_score"].mean()) if len(ok) else 0.0,
+        "critical_error_rate": float(ok["critical_error"].mean()) if len(ok) else 0.0,
+        "avg_fluency": float(ok["fluency_score"].mean()) if len(ok) else 0.0,
+    }
+
+    df_out.to_csv(OUT_CSV_PATH, index=False, encoding="utf-8-sig")
+    print("✅ Saved report to:", OUT_CSV_PATH)
+    print("===== SUMMARY =====")
+    print(summary)
+
+    return df_out, summary
+
+# Run
+df_gen, summary_gen = evaluate_generation_from_excel()
 
 TELEGRAM_TOKEN = "xxxxxxxxxxxxxxxxxxx"
 
@@ -1256,3 +1789,5 @@ def start_bot():
 
 
 start_bot()
+
+
