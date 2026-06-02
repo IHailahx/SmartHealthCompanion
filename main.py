@@ -135,7 +135,7 @@ def load_reranker_model(device="cuda"):
 # Content (documents): The raw data (usually text) that you want to store and embed. Documents are converted into numerical vector embeddings using an embedding function.
 # Metadata (metadatas): A dictionary of additional information associated with each document, used for filtering, categorizing, and providing context.
 # ---------------------------------
-def init_chroma_collection(path=r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\chroma_store", name="healthcare_rag_v2"):
+def init_chroma_collection(path=r"C:\Users\path\Project\AI_Tools_Final\Data\chroma_store", name="healthcare_rag_v2"):
 
     client = chromadb.PersistentClient(path=path)
 
@@ -959,28 +959,28 @@ if __name__ == "__main__":
 # ============================================================
 url_chunks = crawl_all_awareness()
 store_chunks_in_chroma(url_chunks, collection, embed_model, batch_size=128)
-save_jsonl(url_chunks,r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\ChildHealth.jsonl")
+save_jsonl(url_chunks,r"C:\Users\path\Project\AI_Tools_Final\Data\ChildHealth.jsonl")
 
 # ============================================================
 #  Load PDF
 # ============================================================
-output_jsonl__pdf_path = r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\pdf_output.jsonl"
-pdf_chunks = chunk_pdf_pages(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\Dose-fo-Awareness-2.pdf", output_jsonl__pdf_path,normalize=True)
+output_jsonl__pdf_path = r"C:\Users\path\Project\AI_Tools_Final\Data\pdf_output.jsonl"
+pdf_chunks = chunk_pdf_pages(r"C:\Users\path\Project\AI_Tools_Final\Data\Dose-fo-Awareness-2.pdf", output_jsonl__pdf_path,normalize=True)
 store_chunks_in_chroma(pdf_chunks, collection, embed_model, batch_size=128)
 
-# ChildsHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\ChildHealth.jsonl")
-# ElderlysHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\ElderlyHealth.jsonl")
-# Firstaid = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\FirstAid.jsonl")
-# HealthyLifeStyle = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\HealthyLifestyle.jsonl")
-# OralHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\OralHealth.jsonl")
-# PatientsRight = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\PatientRight.jsonl")
-# Pilgrims_Health = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\Pilgrims_Health.jsonl")
-# SeasonalAndFestivalHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\SeasonalFestivalHealth.jsonl")
-# VariousTopics = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\VariousTopic.jsonl")
-# WomensHealth = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\WomenHealth.jsonl")
-# BeforeMarriage = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\BeforeMarriage.jsonl")
-# ChronicDisease = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\ChronicDisease.jsonl")
-# EducationalContent = read_jsonl_file(r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\EducationalContent.jsonl")
+# ChildsHealth = read_jsonl_file(r"C:\Users\path\Project\AI_Tools_Final\Data\ChildHealth.jsonl")
+# ElderlysHealth = read_jsonl_file(r"C:\Users\path\Project\AI_Tools_Final\Data\ElderlyHealth.jsonl")
+# Firstaid = read_jsonl_file(r"C:\Users\path\Project\AI_Tools_Final\Data\FirstAid.jsonl")
+# HealthyLifeStyle = read_jsonl_file(r"C:\Users\path\Project\AI_Tools_Final\Data\HealthyLifestyle.jsonl")
+# OralHealth = read_jsonl_file(r"C:\Users\path\Project\AI_Tools_Final\Data\OralHealth.jsonl")
+# PatientsRight = read_jsonl_file(r"C:\Users\path\Project\AI_Tools_Final\Data\PatientRight.jsonl")
+# Pilgrims_Health = read_jsonl_file(r"C:\Users\path\Project\AI_Tools_Final\Data\Pilgrims_Health.jsonl")
+# SeasonalAndFestivalHealth = read_jsonl_file(r"C:\Users\path\Project\AI_Tools_Final\Data\SeasonalFestivalHealth.jsonl")
+# VariousTopics = read_jsonl_file(r"C:\Users\path\Project\AI_Tools_Final\Data\VariousTopic.jsonl")
+# WomensHealth = read_jsonl_file(r"C:\Users\path\Project\AI_Tools_Final\Data\WomenHealth.jsonl")
+# BeforeMarriage = read_jsonl_file(r"C:\Users\path\Project\AI_Tools_Final\Data\BeforeMarriage.jsonl")
+# ChronicDisease = read_jsonl_file(r"C:\Users\path\Project\AI_Tools_Final\Data\ChronicDisease.jsonl")
+# EducationalContent = read_jsonl_file(r"C:\Users\path\Project\AI_Tools_Final\Data\EducationalContent.jsonl")
 
 
 # store_chunks_in_chroma(ChildsHealth, collection, embed_model, batch_size=128)
@@ -1312,8 +1312,8 @@ def export_top_sources_for_annotation(
     print("Saved:", out_excel)
 
 export_top_sources_for_annotation(
-    questions_excel=r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\questions.xlsx",
-    out_excel=r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\top10_sources_for_gold.xlsx",
+    questions_excel=r"C:\Users\path\Project\AI_Tools_Final\Data\questions.xlsx",
+    out_excel=r"C:\Users\path\Project\AI_Tools_Final\Data\top10_sources_for_gold.xlsx",
     pool_chunks=30,
     target_unique_sources=10
 )
@@ -1387,9 +1387,9 @@ def evaluate_hit_mrr_at_3(
 
 
 evaluate_hit_mrr_at_3(
-    questions_excel=r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\questions.xlsx",
-    marked_gold_excel=r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\top10_sources_for_gold.xlsx",
-    out_excel=r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\eval_hit3.xlsx"
+    questions_excel=r"C:\Users\path\Project\AI_Tools_Final\Data\questions.xlsx",
+    marked_gold_excel=r"C:\Users\path\Project\AI_Tools_Final\Data\top10_sources_for_gold.xlsx",
+    out_excel=r"C:\Users\path\Project\AI_Tools_Final\Data\eval_hit3.xlsx"
 )
 
 
@@ -1421,8 +1421,8 @@ from typing import List, Dict, Any, Tuple
 # ----------------------------
 # Config
 # ----------------------------
-EVAL_XLSX_PATH = r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\EvaluationForGeneration.xlsx"
-OUT_CSV_PATH = r"C:\Users\haila\OneDrive\Desktop\Project\AI_Tools_Final\Data\rag_generation_judge_report.csv"
+EVAL_XLSX_PATH = r"C:\Users\path\Project\AI_Tools_Final\Data\EvaluationForGeneration.xlsx"
+OUT_CSV_PATH = r"C:\Users\path\Project\AI_Tools_Final\Data\rag_generation_judge_report.csv"
 
 JUDGE_MODEL = "gpt-4o-mini"
 MAX_RETRIES = 3
